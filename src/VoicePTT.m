@@ -7,6 +7,8 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 #include <sys/sysctl.h>
 #include <stdlib.h>
+#include <stdatomic.h>
+#include <signal.h>
 
 typedef NS_ENUM(NSInteger, PTTMode) {
     PTTModeSmart = 0,     // Hold to talk, OR quick double-tap to lock hands-free
@@ -330,13 +332,8 @@ static NSData *BuildWAVData(NSData *pcmData) {
 // -----------------------------------------------------------------------------
 // Focus Detection via Accessibility API (Smart Auto Paste vs. Clipboard)
 // -----------------------------------------------------------------------------
-static BOOL IsFocusedElementEditableText(NSString **outAppName) {
-    NSRunningApplication *frontApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
-    if (outAppName) {
-        *outAppName = frontApp.localizedName ?: @"";
-    }
-    NSString *bundleID = frontApp.bundleIdentifier ?: @"";
-
+static BOOL IsKnownTerminalBundleID(NSString *bundleID) {
+    if (bundleID.length == 0) return NO;
     // GPU/custom terminals often don't expose standard AXTextArea attributes
     static NSSet<NSString *> *terminalBundles = nil;
     static dispatch_once_t onceToken;
@@ -353,7 +350,12 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
             @"org.gnu.Emacs"
         ]];
     });
-    if ([terminalBundles containsObject:bundleID]) {
+    return [terminalBundles containsObject:bundleID];
+}
+
+// Thread-safe: runs AXUIElement IPC off the main thread so unresponsive apps never stall UI
+static BOOL IsFocusedElementEditableTextForBundleID(NSString *bundleID) {
+    if (IsKnownTerminalBundleID(bundleID)) {
         return YES;
     }
 
@@ -471,18 +473,45 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 
     CFMachPortRef _eventTap;
     CFRunLoopSourceRef _eventTapSource;
+    CFRunLoopRef _eventTapRunLoop;
+
+    // Lock-free atomic state mirrored for the dedicated high-priority CGEventTap thread
+    _Atomic BOOL _tapCaptureMediaButton;
+    _Atomic NSInteger _tapHotkeyIndex;
+    _Atomic NSInteger _tapAppState;
+    _Atomic BOOL _tapTriggerKeyIsDown;
+    _Atomic BOOL _tapOtherKeyPressedDuringHold;
+    _Atomic BOOL _tapShuttingDown;
+    _Atomic int _tapTimeoutBurstCount;
+    _Atomic double _tapTimeoutWindowStart;
+
+    // Atomic mirrors for non-blocking AudioControlQueue coordination
+    _Atomic BOOL _micArmedAtomic;
+    _Atomic BOOL _audioQueueRunningAtomic;
+    _Atomic uint64_t _audioRestartGen;
 }
 - (void)handleTriggerDown;
 - (void)handleTriggerUp;
 - (void)handleMediaButtonToggle;
 - (void)cancelRecording;
 - (float)effectiveGateThresholdLocked;
+- (void)scheduleAudioCaptureRestart:(NSTimeInterval)delay;
+- (void)reenableEventTapIfAlive;
 
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSPanel *osdPanel;
 @property (nonatomic, strong) LiveOSDView *osdView;
 @property (nonatomic, strong) NSTask *serverTask;
 @property (nonatomic, strong) NSLock *audioLock;
+@property (nonatomic, strong) NSLock *tapLifecycleLock;
+@property (nonatomic, strong) NSThread *eventTapThread;
+@property (nonatomic, strong) dispatch_queue_t audioControlQueue;
+@property (nonatomic, strong) NSLock *audioCacheLock;
+@property (nonatomic, copy) NSArray<AudioInputDeviceInfo *> *cachedInputDevices;
+@property (nonatomic, assign) float cachedInputGain;
+@property (nonatomic, assign) BOOL needsAudioRestartWhenIdle;
+@property (nonatomic, assign) NSInteger audioRestartRetryCount;
+@property (nonatomic, assign) NSTimeInterval lastMediaButtonToggleTime;
 @property (nonatomic, assign) AppState state;
 @property (nonatomic, assign) PTTMode mode;
 @property (nonatomic, assign) OutputMode outputMode;
@@ -495,8 +524,6 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 @property (nonatomic, assign) BOOL liveCaptionEnabled;
 @property (nonatomic, assign) BOOL addTrailingSpace;
 @property (nonatomic, assign) BOOL captureMediaButton;
-@property (nonatomic, assign) BOOL triggerKeyIsDown;
-@property (nonatomic, assign) BOOL otherKeyPressedDuringHold;
 @property (nonatomic, assign) NSTimeInterval holdStartTime;
 @property (nonatomic, assign) NSTimeInterval lastShortTapReleaseTime;
 @property (nonatomic, copy) NSString *committedText;
@@ -510,7 +537,6 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 @property (nonatomic, strong) NSTimer *streamTimer;
 @property (nonatomic, strong) NSTimer *postRollTimer;
 @property (nonatomic, strong) NSTimer *toastTimer;
-@property (nonatomic, strong) NSTimer *audioRestartTimer;
 @property (nonatomic, assign) BOOL streamPassInFlight;
 @property (nonatomic, assign) uint64_t lastStreamPassEndSample;
 @property (nonatomic, assign) BOOL finalizePending;
@@ -522,7 +548,43 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 @property (nonatomic, copy) NSString *baseDir;
 @property (nonatomic, copy) NSDictionary *pipelineConfig;
 @property (nonatomic, copy) AudioObjectPropertyListenerBlock hwListenerBlock;
+#ifdef VOICEPTT_TEST
+@property (nonatomic, strong) NSURLSession *testURLSession;
+@property (nonatomic, copy) NSString *testConfigDirOverride;
+@property (nonatomic, copy) BOOL (^testRestartAudioHook)(void);
+@property (nonatomic, copy) void (^testDeliverTextHook)(NSString *text, BOOL shouldPaste, NSString *statusTag);
+@property (nonatomic, copy) OSStatus (^testEnqueueBufferHook)(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
+@property (nonatomic, copy) NSString *testFrontAppNameOverride;
+@property (nonatomic, copy) NSString *testFrontAppBundleIDOverride;
+@property (nonatomic, assign) NSTimeInterval testRetryDelayOverride;
+#endif
 @end
+
+static void AudioQueueRunningListener(void *inUserData,
+                                      AudioQueueRef inAQ,
+                                      AudioQueuePropertyID inID) {
+    if (inID != kAudioQueueProperty_IsRunning) return;
+    VoicePTTApp *app = (__bridge VoicePTTApp *)inUserData;
+    if (!app || atomic_load(&app->_tapShuttingDown)) return;
+
+    UInt32 isRunning = 0;
+    UInt32 size = sizeof(isRunning);
+    OSStatus st = AudioQueueGetProperty(inAQ, kAudioQueueProperty_IsRunning, &isRunning, &size);
+    if (st == noErr && isRunning == 0) {
+        BOOL unexpectedStop = NO;
+        [app.audioLock lock];
+        if (app->_audioQueue == inAQ && app->_audioQueueRunning) {
+            app->_audioQueueRunning = NO;
+            atomic_store(&app->_audioQueueRunningAtomic, NO);
+            unexpectedStop = YES;
+        }
+        [app.audioLock unlock];
+        if (unexpectedStop && atomic_load(&app->_micArmedAtomic)) {
+            NSLog(@"VoicePTT: AudioQueue stopped unexpectedly (audio device removed?), scheduling recovery");
+            [app scheduleAudioCaptureRestart:0.8];
+        }
+    }
+}
 
 static void AudioInputCallback(void *inUserData,
                                AudioQueueRef inAQ,
@@ -540,7 +602,7 @@ static void AudioInputCallback(void *inUserData,
     float gateThresh = 0.025f;
 
     [app.audioLock lock];
-    if (app->_audioQueueRunning && app->_ringSamples && bytes >= sizeof(int16_t)) {
+    if (app->_audioQueueRunning && app->_audioQueue == inAQ && app->_ringSamples && bytes >= sizeof(int16_t)) {
         const int16_t *samples = (const int16_t *)inBuffer->mAudioData;
         UInt32 count = bytes / sizeof(int16_t);
 
@@ -597,7 +659,31 @@ static void AudioInputCallback(void *inUserData,
     [app.audioLock unlock];
 
     if (shouldReenqueue) {
-        AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+        OSStatus enqStatus = noErr;
+#ifdef VOICEPTT_TEST
+        if (app.testEnqueueBufferHook) {
+            enqStatus = app.testEnqueueBufferHook(inAQ, inBuffer);
+        } else {
+            enqStatus = AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+        }
+#else
+        enqStatus = AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+#endif
+        if (enqStatus != noErr) {
+            BOOL shouldRecover = NO;
+            [app.audioLock lock];
+            if (app->_audioQueue == inAQ && app->_audioQueueRunning) {
+                app->_audioQueueRunning = NO;
+                atomic_store(&app->_audioQueueRunningAtomic, NO);
+                shouldRecover = YES;
+            }
+            [app.audioLock unlock];
+            if (shouldRecover && atomic_load(&app->_micArmedAtomic)) {
+                NSLog(@"VoicePTT: AudioQueueEnqueueBuffer failed (%d), scheduling recovery", (int)enqStatus);
+                [app scheduleAudioCaptureRestart:0.8];
+            }
+            return;
+        }
 
         // Only wake main thread for live meter redraw while actively capturing
         if (isCapturing) {
@@ -615,101 +701,187 @@ static void AudioInputCallback(void *inUserData,
 }
 
 static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *userInfo) {
-    VoicePTTApp *app = (__bridge VoicePTTApp *)userInfo;
-    if (!app) return event;
+    @autoreleasepool {
+        VoicePTTApp *app = (__bridge VoicePTTApp *)userInfo;
+        if (!app) return event;
 
-    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-        if (app->_eventTap) {
-            CGEventTapEnable(app->_eventTap, true);
-        }
-        return event;
-    }
-
-    // Intercept Apple headset inline button / media Play-Pause key (NX_KEYTYPE_PLAY = 16)
-    if (type == NX_SYSDEFINED && app.captureMediaButton) {
-        NSEvent *nsEvent = [NSEvent eventWithCGEvent:event];
-        if (nsEvent && nsEvent.subtype == 8) { // NX_SUBTYPE_AUX_CONTROL_BUTTONS
-            NSInteger data1 = nsEvent.data1;
-            int mediaKeyCode = (int)((data1 & 0xFFFF0000) >> 16);
-            int keyFlags = (int)(data1 & 0x0000FFFF);
-            int keyState = (keyFlags & 0xFF00) >> 8; // 0x0A = keyDown, 0x0B = keyUp
-            BOOL isRepeat = (keyFlags & 0x1) != 0;
-            if (mediaKeyCode == NX_KEYTYPE_PLAY) {
-                if (keyState == 0x0A && !isRepeat) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [app handleMediaButtonToggle];
-                    });
+        if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+            atomic_store(&app->_tapTriggerKeyIsDown, NO);
+            atomic_store(&app->_tapOtherKeyPressedDuringHold, NO);
+            if (atomic_load(&app->_tapShuttingDown)) {
+                return event;
+            }
+            if (type == kCGEventTapDisabledByTimeout) {
+                double now = CACurrentMediaTime();
+                double winStart = atomic_load(&app->_tapTimeoutWindowStart);
+                int burst = 1;
+                if (now - winStart > 10.0) {
+                    atomic_store(&app->_tapTimeoutWindowStart, now);
+                    atomic_store(&app->_tapTimeoutBurstCount, 1);
+                } else {
+                    burst = atomic_fetch_add(&app->_tapTimeoutBurstCount, 1) + 1;
                 }
+                NSLog(@"VoicePTT: CGEventTap disabled by timeout (burst=%d)", burst);
+                if (burst >= 4) {
+                    // Circuit breaker: back off instead of looping and stalling WindowServer
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [app reenableEventTapIfAlive];
+                    });
+                    return event;
+                }
+            }
+            if (app->_eventTap) {
+                CGEventTapEnable(app->_eventTap, true);
+            }
+            return event;
+        }
+
+        // Handle NX_SYSDEFINED early and always return — never inspect keyboard fields on system events
+        if (type == NX_SYSDEFINED) {
+            if (!atomic_load(&app->_tapCaptureMediaButton)) {
+                return event;
+            }
+            NSEvent *nsEvent = [NSEvent eventWithCGEvent:event];
+            if (nsEvent && nsEvent.subtype == 8) { // NX_SUBTYPE_AUX_CONTROL_BUTTONS
+                NSInteger data1 = nsEvent.data1;
+                int mediaKeyCode = (int)((data1 & 0xFFFF0000) >> 16);
+                int keyFlags = (int)(data1 & 0x0000FFFF);
+                int keyState = (keyFlags & 0xFF00) >> 8; // 0x0A = keyDown, 0x0B = keyUp
+                BOOL isRepeat = (keyFlags & 0x1) != 0;
+                if (mediaKeyCode == NX_KEYTYPE_PLAY) {
+                    if (keyState == 0x0A && !isRepeat) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [app handleMediaButtonToggle];
+                        });
+                    }
+                    return NULL;
+                }
+            }
+            return event;
+        }
+
+        CGKeyCode keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        CGEventFlags flags = CGEventGetFlags(event);
+
+        // Esc cancels active recording without pasting
+        if (type == kCGEventKeyDown && keyCode == 53) {
+            AppState curState = (AppState)atomic_load(&app->_tapAppState);
+            if (curState == AppStateHolding || curState == AppStateLocked) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [app cancelRecording];
+                });
                 return NULL;
             }
+            return event;
         }
-        return event;
-    }
 
-    CGKeyCode keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-    CGEventFlags flags = CGEventGetFlags(event);
+        NSInteger hkIdx = atomic_load(&app->_tapHotkeyIndex);
+        if (hkIdx < 0 || hkIdx >= kHotkeyOptionCount) hkIdx = 0;
+        HotkeyOption hk = kHotkeyOptions[hkIdx];
 
-    // Esc cancels active recording without pasting
-    if (type == kCGEventKeyDown && keyCode == 53) {
-        if (app.state == AppStateHolding || app.state == AppStateLocked) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [app cancelRecording];
-            });
-            return NULL;
-        }
-        return event;
-    }
-
-    HotkeyOption hk = kHotkeyOptions[app.hotkeyIndex];
-
-    if (hk.isModifier) {
-        if (type == kCGEventFlagsChanged && keyCode == hk.keyCode) {
-            BOOL isNowDown = (flags & hk.modifierMask) != 0;
-            if (isNowDown && !app.triggerKeyIsDown) {
-                app.triggerKeyIsDown = YES;
-                app.otherKeyPressedDuringHold = NO;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [app handleTriggerDown];
-                });
-            } else if (!isNowDown && app.triggerKeyIsDown) {
-                app.triggerKeyIsDown = NO;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [app handleTriggerUp];
-                });
-            }
-        } else if (type == kCGEventKeyDown && app.triggerKeyIsDown) {
-            app.otherKeyPressedDuringHold = YES;
-        }
-    } else {
-        if (keyCode == hk.keyCode) {
-            if (type == kCGEventKeyDown) {
-                int64_t isRepeat = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat);
-                if (isRepeat == 0 && !app.triggerKeyIsDown) {
-                    app.triggerKeyIsDown = YES;
+        if (hk.isModifier) {
+            if (type == kCGEventFlagsChanged && keyCode == hk.keyCode) {
+                BOOL isNowDown = (flags & hk.modifierMask) != 0;
+                BOOL wasDown = atomic_load(&app->_tapTriggerKeyIsDown);
+                if (isNowDown && !wasDown) {
+                    atomic_store(&app->_tapTriggerKeyIsDown, YES);
+                    atomic_store(&app->_tapOtherKeyPressedDuringHold, NO);
                     dispatch_async(dispatch_get_main_queue(), ^{
                         [app handleTriggerDown];
                     });
-                }
-                return NULL;
-            } else if (type == kCGEventKeyUp) {
-                if (app.triggerKeyIsDown) {
-                    app.triggerKeyIsDown = NO;
+                } else if (!isNowDown && wasDown) {
+                    atomic_store(&app->_tapTriggerKeyIsDown, NO);
                     dispatch_async(dispatch_get_main_queue(), ^{
                         [app handleTriggerUp];
                     });
                 }
-                return NULL;
+            } else if (type == kCGEventKeyDown && atomic_load(&app->_tapTriggerKeyIsDown)) {
+                atomic_store(&app->_tapOtherKeyPressedDuringHold, YES);
+            }
+        } else {
+            if (keyCode == hk.keyCode) {
+                if (type == kCGEventKeyDown) {
+                    int64_t isRepeat = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat);
+                    if (isRepeat == 0 && !atomic_load(&app->_tapTriggerKeyIsDown)) {
+                        atomic_store(&app->_tapTriggerKeyIsDown, YES);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [app handleTriggerDown];
+                        });
+                    }
+                    return NULL;
+                } else if (type == kCGEventKeyUp) {
+                    if (atomic_load(&app->_tapTriggerKeyIsDown)) {
+                        atomic_store(&app->_tapTriggerKeyIsDown, NO);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [app handleTriggerUp];
+                        });
+                    }
+                    return NULL;
+                }
             }
         }
-    }
 
-    return event;
+        return event;
+    }
 }
 
 @implementation VoicePTTApp
 
+- (void)setState:(AppState)state {
+    _state = state;
+    atomic_store(&_tapAppState, (NSInteger)state);
+    if (state == AppStateIdle && self.needsAudioRestartWhenIdle && self.micArmed) {
+        self.needsAudioRestartWhenIdle = NO;
+        [self scheduleAudioCaptureRestart:0.25];
+    }
+}
+
+- (void)setHotkeyIndex:(NSInteger)hotkeyIndex {
+    _hotkeyIndex = hotkeyIndex;
+    atomic_store(&_tapHotkeyIndex, hotkeyIndex);
+}
+
+- (void)setCaptureMediaButton:(BOOL)captureMediaButton {
+    _captureMediaButton = captureMediaButton;
+    atomic_store(&_tapCaptureMediaButton, captureMediaButton);
+}
+
+- (void)setMicArmed:(BOOL)micArmed {
+    _micArmed = micArmed;
+    atomic_store(&_micArmedAtomic, micArmed);
+}
+
+- (void)setSelectedMicUID:(NSString *)selectedMicUID {
+    NSString *copied = [selectedMicUID copy] ?: @"";
+    [self.audioCacheLock lock];
+    _selectedMicUID = copied;
+    [self.audioCacheLock unlock];
+}
+
+- (NSString *)selectedMicUIDSnapshot {
+    [self.audioCacheLock lock];
+    NSString *uid = _selectedMicUID ?: @"";
+    [self.audioCacheLock unlock];
+    return uid;
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     self.audioLock = [NSLock new];
+    self.tapLifecycleLock = [NSLock new];
+    self.audioCacheLock = [NSLock new];
+    dispatch_queue_attr_t audioAttr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+    self.audioControlQueue = dispatch_queue_create("local.voiceptt.audio.control", audioAttr);
+    self.cachedInputDevices = @[];
+    self.cachedInputGain = -1.0f;
+
+    atomic_store(&_tapShuttingDown, NO);
+    atomic_store(&_tapTriggerKeyIsDown, NO);
+    atomic_store(&_tapOtherKeyPressedDuringHold, NO);
+    atomic_store(&_tapTimeoutBurstCount, 0);
+    atomic_store(&_tapTimeoutWindowStart, 0.0);
+    atomic_store(&_audioQueueRunningAtomic, NO);
+    atomic_store(&_audioRestartGen, 0);
+
     _ringSamples = (int16_t *)calloc((size_t)kRingCapacitySamples, sizeof(int16_t));
     _ambientNoiseFloor = 0.008f;
     self.state = AppStateStarting;
@@ -735,32 +907,55 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [self setupStatusItem];
     [self setupFloatingOSD];
     [self setupAudioLifecycleObservers];
+    [self refreshAudioDeviceCacheAsync];
     [self requestMicrophonePermissionAndArm];
     [self startWhisperServer];
     [self setupEventTapWithPrompt:YES];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    atomic_store(&_tapShuttingDown, YES);
+    atomic_fetch_add(&_audioRestartGen, 1);
+
     [self stopStreamTimer];
     [self.postRollTimer invalidate];
     [self.toastTimer invalidate];
-    [self.audioRestartTimer invalidate];
-    [self teardownAudioLifecycleObservers];
-    [self stopContinuousAudioCapture];
+    [self.permPollTimer invalidate];
+    [self.healthTimer invalidate];
+
+    // Disable and stop the dedicated event tap thread immediately
+    [self.tapLifecycleLock lock];
     if (_eventTap) {
         CGEventTapEnable(_eventTap, false);
-        CFRelease(_eventTap);
-        _eventTap = NULL;
+        CFMachPortInvalidate(_eventTap);
     }
+    if (_eventTapRunLoop) {
+        CFRunLoopStop(_eventTapRunLoop);
+    }
+    [self.tapLifecycleLock unlock];
+
+    [self teardownAudioLifecycleObservers];
+
     if (self.serverTask && self.serverTask.isRunning) {
         [self.serverTask terminate];
     }
-    [self.audioLock lock];
-    if (_ringSamples) {
-        free(_ringSamples);
-        _ringSamples = NULL;
+
+    // Bounded teardown so quitting never hangs even if coreaudiod is stalled
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(self.audioControlQueue, ^{
+        [self stopAudioCaptureOnAudioQueue];
+        dispatch_semaphore_signal(done);
+    });
+    BOOL stoppedCleanly = (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC))) == 0);
+
+    if (stoppedCleanly) {
+        [self.audioLock lock];
+        if (_ringSamples) {
+            free(_ringSamples);
+            _ringSamples = NULL;
+        }
+        [self.audioLock unlock];
     }
-    [self.audioLock unlock];
 }
 
 #pragma mark - Preferences & Pipeline Config
@@ -809,7 +1004,20 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
 }
 
+- (NSURLSession *)activeURLSession {
+#ifdef VOICEPTT_TEST
+    if (self.testURLSession) return self.testURLSession;
+#endif
+    return [NSURLSession sharedSession];
+}
+
 - (NSString *)configDirPath {
+#ifdef VOICEPTT_TEST
+    if (self.testConfigDirOverride.length > 0) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:self.testConfigDirOverride withIntermediateDirectories:YES attributes:nil error:nil];
+        return self.testConfigDirOverride;
+    }
+#endif
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@".config/voice-ptt"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
@@ -968,14 +1176,14 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
         if (status == AVAuthorizationStatusAuthorized) {
             if (self.micArmed) {
-                [self startContinuousAudioCapture];
+                [self scheduleAudioCaptureRestart:0.0];
             }
         } else if (status == AVAuthorizationStatusNotDetermined) {
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
                 if (granted) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         if (self.micArmed) {
-                            [self startContinuousAudioCapture];
+                            [self scheduleAudioCaptureRestart:0.0];
                             [self updateUI];
                         }
                     });
@@ -984,7 +1192,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         }
     } else {
         if (self.micArmed) {
-            [self startContinuousAudioCapture];
+            [self scheduleAudioCaptureRestart:0.0];
         }
     }
 }
@@ -998,8 +1206,12 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     __weak typeof(self) weakSelf = self;
     self.hwListenerBlock = ^(UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        [strongSelf scheduleAudioCaptureRestart:0.6];
+        if (!strongSelf || atomic_load(&strongSelf->_tapShuttingDown)) return;
+        // Runs on audioControlQueue — never blocks the main thread or CGEventTap!
+        [strongSelf refreshCachedAudioDevicesOnAudioQueue];
+        if (atomic_load(&strongSelf->_micArmedAtomic)) {
+            [strongSelf scheduleAudioCaptureRestart:0.8];
+        }
     };
 
     AudioObjectPropertyAddress devAddr = {
@@ -1012,8 +1224,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &devAddr, dispatch_get_main_queue(), self.hwListenerBlock);
-    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &defAddr, dispatch_get_main_queue(), self.hwListenerBlock);
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &devAddr, self.audioControlQueue, self.hwListenerBlock);
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &defAddr, self.audioControlQueue, self.hwListenerBlock);
 }
 
 - (void)teardownAudioLifecycleObservers {
@@ -1029,8 +1241,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             kAudioObjectPropertyScopeGlobal,
             kAudioObjectPropertyElementMain
         };
-        AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &devAddr, dispatch_get_main_queue(), self.hwListenerBlock);
-        AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &defAddr, dispatch_get_main_queue(), self.hwListenerBlock);
+        AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &devAddr, self.audioControlQueue, self.hwListenerBlock);
+        AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &defAddr, self.audioControlQueue, self.hwListenerBlock);
         self.hwListenerBlock = nil;
     }
 }
@@ -1039,22 +1251,95 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [self scheduleAudioCaptureRestart:1.0];
 }
 
+// Thread-safe, debounced, coalesced restart completely off the main thread
 - (void)scheduleAudioCaptureRestart:(NSTimeInterval)delay {
-    if (!self.micArmed) return;
-    [self.audioRestartTimer invalidate];
+    if (!atomic_load(&_micArmedAtomic) || atomic_load(&_tapShuttingDown)) return;
+    uint64_t gen = atomic_fetch_add(&_audioRestartGen, 1) + 1;
+    int64_t delayNs = (int64_t)(MAX(0.0, delay) * (double)NSEC_PER_SEC);
     __weak typeof(self) weakSelf = self;
-    self.audioRestartTimer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(NSTimer * _Nonnull timer) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNs), self.audioControlQueue, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.micArmed) return;
-        if (strongSelf.state == AppStateIdle || strongSelf.state == AppStateStarting) {
-            [strongSelf startContinuousAudioCapture];
-            [strongSelf updateUI];
+        if (!strongSelf || atomic_load(&strongSelf->_tapShuttingDown)) return;
+        if (atomic_load(&strongSelf->_audioRestartGen) != gen) return;
+        if (!atomic_load(&strongSelf->_micArmedAtomic)) return;
+
+        AppState st = (AppState)atomic_load(&strongSelf->_tapAppState);
+        if (st == AppStateIdle || st == AppStateStarting) {
+            BOOL ok = [strongSelf restartAudioCaptureOnAudioQueue];
+            if (ok) {
+                strongSelf.audioRestartRetryCount = 0;
+            } else if (strongSelf.audioRestartRetryCount < 3) {
+                strongSelf.audioRestartRetryCount++;
+                NSTimeInterval retryDelay = 1.5;
+#ifdef VOICEPTT_TEST
+                if (strongSelf.testRetryDelayOverride > 0.0) {
+                    retryDelay = strongSelf.testRetryDelayOverride;
+                }
+#endif
+                [strongSelf scheduleAudioCaptureRestart:retryDelay];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                strongSelf.needsAudioRestartWhenIdle = NO;
+                [strongSelf updateUI];
+            });
+        } else {
+            // Defer restart until active recording/transcription finishes
+            dispatch_async(dispatch_get_main_queue(), ^{
+                strongSelf.needsAudioRestartWhenIdle = YES;
+            });
         }
-    }];
+    });
+}
+
+- (void)reenableEventTapIfAlive {
+    if (atomic_load(&_tapShuttingDown)) return;
+    [self.tapLifecycleLock lock];
+    if (_eventTap && CFMachPortIsValid(_eventTap)) {
+        atomic_store(&_tapTimeoutBurstCount, 0);
+        CGEventTapEnable(_eventTap, true);
+    }
+    [self.tapLifecycleLock unlock];
+}
+
+- (void)eventTapThreadMain {
+    @autoreleasepool {
+        CFRunLoopRef rl = CFRunLoopGetCurrent();
+        CFRetain(rl);
+
+        [self.tapLifecycleLock lock];
+        _eventTapRunLoop = rl;
+        CFMachPortRef tap = _eventTap;
+        CFRunLoopSourceRef src = _eventTapSource;
+        [self.tapLifecycleLock unlock];
+
+        if (tap && src && !atomic_load(&_tapShuttingDown)) {
+            CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap, true);
+            CFRunLoopRun();
+            CFRunLoopRemoveSource(rl, src, kCFRunLoopCommonModes);
+        }
+
+        [self.tapLifecycleLock lock];
+        if (_eventTapRunLoop == rl) {
+            _eventTapRunLoop = NULL;
+        }
+        if (_eventTapSource) {
+            CFRelease(_eventTapSource);
+            _eventTapSource = NULL;
+        }
+        if (_eventTap) {
+            CGEventTapEnable(_eventTap, false);
+            CFMachPortInvalidate(_eventTap);
+            CFRelease(_eventTap);
+            _eventTap = NULL;
+        }
+        [self.tapLifecycleLock unlock];
+        CFRelease(rl);
+    }
 }
 
 - (void)setupEventTapWithPrompt:(BOOL)prompt {
-    if (_eventTap) return;
+    if (self.eventTapThread || _eventTap) return;
 
     NSDictionary *opts = @{ (__bridge id)kAXTrustedCheckOptionPrompt: @(prompt) };
     BOOL trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
@@ -1072,17 +1357,27 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return;
     }
 
+    // Attach active CGEventTap ONLY to a dedicated UserInteractive background CFRunLoop
+    // so main-thread UI, CoreAudio, or AX work can NEVER freeze macOS keyboard/mouse input.
     CGEventMask mask = CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(NX_SYSDEFINED);
-    _eventTap = CGEventTapCreate(kCGSessionEventTap,
-                                 kCGHeadInsertEventTap,
-                                 kCGEventTapOptionDefault,
-                                 mask,
-                                 EventTapCallback,
-                                 (__bridge void *)self);
-    if (_eventTap) {
-        _eventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, _eventTap, 0);
-        CFRunLoopAddSource(CFRunLoopGetMain(), _eventTapSource, kCFRunLoopCommonModes);
-        CGEventTapEnable(_eventTap, true);
+    CFMachPortRef tap = CGEventTapCreate(kCGSessionEventTap,
+                                         kCGHeadInsertEventTap,
+                                         kCGEventTapOptionDefault,
+                                         mask,
+                                         EventTapCallback,
+                                         (__bridge void *)self);
+    if (tap) {
+        CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+        [self.tapLifecycleLock lock];
+        _eventTap = tap;
+        _eventTapSource = src;
+        [self.tapLifecycleLock unlock];
+
+        NSThread *thread = [[NSThread alloc] initWithTarget:self selector:@selector(eventTapThreadMain) object:nil];
+        thread.name = @"VoicePTT.EventTap";
+        thread.qualityOfService = NSQualityOfServiceUserInteractive;
+        self.eventTapThread = thread;
+        [thread start];
     }
     [self updateUI];
 }
@@ -1100,6 +1395,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     [self populateMenu:menu];
+    [self refreshAudioDeviceCacheAsync];
 }
 
 - (void)setupFloatingOSD {
@@ -1220,7 +1516,6 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             [self hideOSD];
         }
     }
-    [self rebuildMenu];
 }
 
 - (void)rebuildMenu {
@@ -1241,7 +1536,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         statusLine = @"Mic Paused (Click 'Continuous Mic Armed' to resume)";
     } else {
         HotkeyOption hk = kHotkeyOptions[self.hotkeyIndex];
-        NSString *capState = _audioQueueRunning ? @"Ring Live" : @"Mic Idle";
+        NSString *capState = atomic_load(&_audioQueueRunningAtomic) ? @"Ring Live" : @"Mic Reconnecting…";
         statusLine = [NSString stringWithFormat:@"Ready (%@) · %@ · %@", capState, hk.label, self.selectedModelPath.lastPathComponent];
     }
     NSMenuItem *statusItem = [[NSMenuItem alloc] initWithTitle:statusLine action:(!AXIsProcessTrusted() ? @selector(openAccessibilityPrefs:) : nil) keyEquivalent:@""];
@@ -1339,9 +1634,16 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     gateParent.submenu = gateMenu;
     [menu addItem:gateParent];
 
-    // Mic Input Gain quick-control submenu
-    AudioDeviceID activeDev = ResolveInputDeviceID(self.selectedMicUID);
-    float curGain = GetInputDeviceGain(activeDev);
+    // Mic Input Gain & Microphone submenus (read from async CoreAudio cache — zero main-thread HAL IPC)
+    NSArray<AudioInputDeviceInfo *> *cachedDevices = nil;
+    float curGain = -1.0f;
+    NSString *curMicUID = @"";
+    [self.audioCacheLock lock];
+    cachedDevices = self.cachedInputDevices ?: @[];
+    curGain = self.cachedInputGain;
+    curMicUID = _selectedMicUID ?: @"";
+    [self.audioCacheLock unlock];
+
     NSString *gainTitle = (curGain >= 0.0f)
         ? [NSString stringWithFormat:@"Mic Input Gain (%d%%)", (int)roundf(curGain * 100.0f)]
         : @"Mic Input Gain";
@@ -1365,13 +1667,13 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     NSMenuItem *defMic = [[NSMenuItem alloc] initWithTitle:@"System Default" action:@selector(selectMic:) keyEquivalent:@""];
     defMic.target = self;
     defMic.representedObject = @"";
-    defMic.state = (self.selectedMicUID.length == 0) ? NSControlStateValueOn : NSControlStateValueOff;
+    defMic.state = (curMicUID.length == 0) ? NSControlStateValueOn : NSControlStateValueOff;
     [micMenu addItem:defMic];
-    for (AudioInputDeviceInfo *dev in ListAudioInputDevices()) {
+    for (AudioInputDeviceInfo *dev in cachedDevices) {
         NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:dev.name action:@selector(selectMic:) keyEquivalent:@""];
         it.target = self;
         it.representedObject = dev.uid;
-        it.state = [self.selectedMicUID isEqualToString:dev.uid] ? NSControlStateValueOn : NSControlStateValueOff;
+        it.state = [curMicUID isEqualToString:dev.uid] ? NSControlStateValueOn : NSControlStateValueOff;
         [micMenu addItem:it];
     }
     micParent.submenu = micMenu;
@@ -1466,12 +1768,12 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     self.micArmed = !self.micArmed;
     [[NSUserDefaults standardUserDefaults] setBool:self.micArmed forKey:kPrefMicArmedKey];
     if (self.micArmed) {
-        [self startContinuousAudioCapture];
+        [self scheduleAudioCaptureRestart:0.0];
     } else {
         if (self.state == AppStateHolding || self.state == AppStateLocked) {
             [self cancelRecording];
         }
-        [self stopContinuousAudioCapture];
+        [self stopContinuousAudioCaptureAsync];
     }
     [self updateUI];
 }
@@ -1490,7 +1792,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (void)selectHotkey:(NSMenuItem *)sender {
     self.hotkeyIndex = sender.tag;
-    self.triggerKeyIsDown = NO;
+    atomic_store(&_tapTriggerKeyIsDown, NO);
+    atomic_store(&_tapOtherKeyPressedDuringHold, NO);
     [[NSUserDefaults standardUserDefaults] setInteger:self.hotkeyIndex forKey:kPrefHotkeyIndexKey];
     [self updateUI];
 }
@@ -1502,16 +1805,24 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)selectMicGain:(NSMenuItem *)sender {
-    AudioDeviceID devID = ResolveInputDeviceID(self.selectedMicUID);
-    SetInputDeviceGain(devID, (float)sender.tag / 100.0f);
-    [self rebuildMenu];
+    float scalar = (float)sender.tag / 100.0f;
+    NSString *uid = [self selectedMicUIDSnapshot];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.audioControlQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        AudioDeviceID devID = ResolveInputDeviceID(uid);
+        SetInputDeviceGain(devID, scalar);
+        [strongSelf refreshCachedAudioDevicesOnAudioQueue];
+    });
 }
 
 - (void)selectMic:(NSMenuItem *)sender {
     self.selectedMicUID = sender.representedObject ?: @"";
     [[NSUserDefaults standardUserDefaults] setObject:self.selectedMicUID forKey:kPrefMicUIDKey];
+    [self refreshAudioDeviceCacheAsync];
     if (self.micArmed) {
-        [self startContinuousAudioCapture];
+        [self scheduleAudioCaptureRestart:0.0];
     }
     [self updateUI];
 }
@@ -1590,16 +1901,37 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)restartServer:(id)sender {
-    if (self.serverTask && self.serverTask.isRunning) {
-        [self.serverTask terminate];
-        [self.serverTask waitUntilExit];
-    }
+    NSTask *oldTask = self.serverTask;
+    self.serverTask = nil;
+    [self.healthTimer invalidate];
+    self.healthTimer = nil;
+
     self.serverReady = NO;
     self.streamPassInFlight = NO;
     self.finalizePending = NO;
     self.state = AppStateStarting;
     [self updateUI];
-    [self startWhisperServer];
+
+    if (oldTask && oldTask.isRunning) {
+        [oldTask terminate];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSTimeInterval deadline = CACurrentMediaTime() + 2.0;
+            while (oldTask.isRunning && CACurrentMediaTime() < deadline) {
+                usleep(25000);
+            }
+            if (oldTask.isRunning) {
+                pid_t pid = oldTask.processIdentifier;
+                if (pid > 0) kill(pid, SIGKILL);
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!atomic_load(&self->_tapShuttingDown)) {
+                    [self startWhisperServer];
+                }
+            });
+        });
+    } else {
+        [self startWhisperServer];
+    }
 }
 
 - (void)quitApp:(id)sender {
@@ -1701,8 +2033,93 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return kGatePresets[self.gatePresetIndex].threshold;
 }
 
-- (BOOL)startContinuousAudioCapture {
-    [self stopContinuousAudioCapture];
+- (void)refreshCachedAudioDevicesOnAudioQueue {
+    NSArray<AudioInputDeviceInfo *> *devices = ListAudioInputDevices();
+    NSString *preferredUID = [self selectedMicUIDSnapshot];
+    AudioDeviceID activeDev = ResolveInputDeviceID(preferredUID);
+    float gain = GetInputDeviceGain(activeDev);
+
+    [self.audioCacheLock lock];
+    self.cachedInputDevices = devices;
+    self.cachedInputGain = gain;
+    [self.audioCacheLock unlock];
+}
+
+- (void)refreshAudioDeviceCacheAsync {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.audioControlQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || atomic_load(&strongSelf->_tapShuttingDown)) return;
+        [strongSelf refreshCachedAudioDevicesOnAudioQueue];
+    });
+}
+
+// Always runs on self.audioControlQueue — NEVER on the main thread!
+- (void)stopAudioCaptureOnAudioQueue {
+    AudioQueueRef aqToDispose = NULL;
+    [self.audioLock lock];
+    _audioQueueRunning = NO;
+    atomic_store(&_audioQueueRunningAtomic, NO);
+    _isCapturingSession = NO;
+    aqToDispose = _audioQueue;
+    _audioQueue = NULL;
+    for (int i = 0; i < 4; i++) {
+        _audioBuffers[i] = NULL;
+    }
+    [self.audioLock unlock];
+
+    if (aqToDispose) {
+        AudioQueueRemovePropertyListener(aqToDispose, kAudioQueueProperty_IsRunning, AudioQueueRunningListener, (__bridge void *)self);
+        // AudioQueueDispose(..., true) stops the queue immediately and disposes it in one call
+        AudioQueueDispose(aqToDispose, true);
+    }
+}
+
+- (void)stopContinuousAudioCaptureAsync {
+    atomic_fetch_add(&_audioRestartGen, 1); // cancel any pending restart
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.audioControlQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf stopAudioCaptureOnAudioQueue];
+    });
+}
+
+// Always runs on self.audioControlQueue — NEVER on the main thread!
+- (BOOL)restartAudioCaptureOnAudioQueue {
+#ifdef VOICEPTT_TEST
+    if (self.testRestartAudioHook) {
+        return self.testRestartAudioHook();
+    }
+#endif
+    [self stopAudioCaptureOnAudioQueue];
+
+    NSArray<AudioInputDeviceInfo *> *devices = ListAudioInputDevices();
+    NSString *preferredUID = [self selectedMicUIDSnapshot];
+
+    // Update menu cache while we already have the device list
+    AudioDeviceID activeDev = ResolveInputDeviceID(preferredUID);
+    float gain = GetInputDeviceGain(activeDev);
+    [self.audioCacheLock lock];
+    self.cachedInputDevices = devices;
+    self.cachedInputGain = gain;
+    [self.audioCacheLock unlock];
+
+    if (devices.count == 0) {
+        NSLog(@"VoicePTT: No audio input devices available yet, will retry");
+        return NO;
+    }
+
+    // Only bind to preferredUID if that device is currently present; otherwise fall back to System Default
+    BOOL preferredPresent = NO;
+    if (preferredUID.length > 0) {
+        for (AudioInputDeviceInfo *d in devices) {
+            if ([d.uid isEqualToString:preferredUID]) {
+                preferredPresent = YES;
+                break;
+            }
+        }
+    }
 
     AudioStreamBasicDescription fmt = {0};
     fmt.mSampleRate = (Float64)kSampleRate;
@@ -1714,15 +2131,41 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     fmt.mBytesPerPacket = 2;
     fmt.mFramesPerPacket = 1;
 
-    OSStatus st = AudioQueueNewInput(&fmt, AudioInputCallback, (__bridge void *)self, NULL, kCFRunLoopCommonModes, 0, &_audioQueue);
-    if (st != noErr || !_audioQueue) {
+    AudioQueueRef newAQ = NULL;
+    OSStatus st = AudioQueueNewInput(&fmt, AudioInputCallback, (__bridge void *)self, NULL, NULL, 0, &newAQ);
+    if (st != noErr || !newAQ) {
         NSLog(@"VoicePTT: AudioQueueNewInput failed: %d", (int)st);
         return NO;
     }
 
-    if (self.selectedMicUID.length > 0) {
-        CFStringRef uid = (__bridge CFStringRef)self.selectedMicUID;
-        AudioQueueSetProperty(_audioQueue, kAudioQueueProperty_CurrentDevice, &uid, sizeof(CFStringRef));
+    if (preferredPresent) {
+        CFStringRef uid = (__bridge CFStringRef)preferredUID;
+        OSStatus devSt = AudioQueueSetProperty(newAQ, kAudioQueueProperty_CurrentDevice, &uid, sizeof(CFStringRef));
+        if (devSt != noErr) {
+            NSLog(@"VoicePTT: Failed to bind preferred mic %@ (%d), falling back to System Default", preferredUID, (int)devSt);
+        }
+    }
+
+    AudioQueueAddPropertyListener(newAQ, kAudioQueueProperty_IsRunning, AudioQueueRunningListener, (__bridge void *)self);
+
+    UInt32 bufBytes = 1600; // 50ms chunks at 16kHz 16-bit mono
+    AudioQueueBufferRef newBuffers[4] = { NULL, NULL, NULL, NULL };
+    for (int i = 0; i < 4; i++) {
+        OSStatus allocSt = AudioQueueAllocateBuffer(newAQ, bufBytes, &newBuffers[i]);
+        if (allocSt != noErr || !newBuffers[i]) {
+            NSLog(@"VoicePTT: AudioQueueAllocateBuffer failed: %d", (int)allocSt);
+            AudioQueueRemovePropertyListener(newAQ, kAudioQueueProperty_IsRunning, AudioQueueRunningListener, (__bridge void *)self);
+            AudioQueueDispose(newAQ, true);
+            return NO;
+        }
+        memset(newBuffers[i]->mAudioData, 0, bufBytes);
+        OSStatus enqSt = AudioQueueEnqueueBuffer(newAQ, newBuffers[i], 0, NULL);
+        if (enqSt != noErr) {
+            NSLog(@"VoicePTT: Initial AudioQueueEnqueueBuffer failed: %d", (int)enqSt);
+            AudioQueueRemovePropertyListener(newAQ, kAudioQueueProperty_IsRunning, AudioQueueRunningListener, (__bridge void *)self);
+            AudioQueueDispose(newAQ, true);
+            return NO;
+        }
     }
 
     [self.audioLock lock];
@@ -1737,36 +2180,21 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     _committedSample = 0;
     _captureLastSpeechSample = 0;
     _capturePeakRMS = 0.0f;
+    _audioQueue = newAQ;
+    for (int i = 0; i < 4; i++) {
+        _audioBuffers[i] = newBuffers[i];
+    }
     _audioQueueRunning = YES;
+    atomic_store(&_audioQueueRunningAtomic, YES);
     [self.audioLock unlock];
 
-    UInt32 bufBytes = 1600; // 50ms chunks at 16kHz 16-bit mono
-    for (int i = 0; i < 4; i++) {
-        AudioQueueAllocateBuffer(_audioQueue, bufBytes, &_audioBuffers[i]);
-        memset(_audioBuffers[i]->mAudioData, 0, bufBytes);
-        AudioQueueEnqueueBuffer(_audioQueue, _audioBuffers[i], 0, NULL);
-    }
-
-    st = AudioQueueStart(_audioQueue, NULL);
+    st = AudioQueueStart(newAQ, NULL);
     if (st != noErr) {
         NSLog(@"VoicePTT: AudioQueueStart failed: %d", (int)st);
-        [self stopContinuousAudioCapture];
+        [self stopAudioCaptureOnAudioQueue];
         return NO;
     }
     return YES;
-}
-
-- (void)stopContinuousAudioCapture {
-    [self.audioLock lock];
-    _audioQueueRunning = NO;
-    _isCapturingSession = NO;
-    [self.audioLock unlock];
-
-    if (_audioQueue) {
-        AudioQueueStop(_audioQueue, true);
-        AudioQueueDispose(_audioQueue, true);
-        _audioQueue = NULL;
-    }
 }
 
 - (NSData *)sliceRingPCMFromSample:(uint64_t)startSample toSample:(uint64_t)endSample {
@@ -1807,8 +2235,10 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         [self showToastWithHeader:@"Mic is Paused" caption:@"Enable 'Continuous Mic Armed' in menu bar" dotColor:[NSColor systemYellowColor] duration:1.8];
         return NO;
     }
-    if (!_audioQueueRunning) {
-        return [self startContinuousAudioCapture];
+    if (!atomic_load(&_audioQueueRunningAtomic)) {
+        [self scheduleAudioCaptureRestart:0.0];
+        [self showToastWithHeader:@"Reconnecting Microphone…" caption:@"Try again in a moment" dotColor:[NSColor systemYellowColor] duration:1.4];
+        return NO;
     }
     return YES;
 }
@@ -1890,7 +2320,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     NSTimeInterval heldDuration = CACurrentMediaTime() - self.holdStartTime;
 
-    if (self.otherKeyPressedDuringHold) {
+    if (atomic_load(&_tapOtherKeyPressedDuringHold)) {
         [self cancelRecording];
         return;
     }
@@ -1916,6 +2346,13 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (void)handleMediaButtonToggle {
     if (!self.serverReady || self.state == AppStateTranscribing) return;
+    // Debounce electrical contact chatter when a 3.5mm TRRS headphone jack is bumped/unplugged
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastMediaButtonToggleTime < 0.35) {
+        return;
+    }
+    self.lastMediaButtonToggleTime = now;
+
     if (self.state == AppStateIdle) {
         [self beginSessionWithState:AppStateLocked];
     } else if (self.state == AppStateHolding || self.state == AppStateLocked) {
@@ -2272,7 +2709,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             ? ((double)(nowSample - lastSpeech) * 1000.0 / (double)kSampleRate)
             : 9999.0;
 
-        if (silenceSinceSpeechMs >= (double)postRollSilenceMs || elapsedMs >= (double)postRollMaxMs) {
+        BOOL micAlive = atomic_load(&_audioQueueRunningAtomic);
+        if (!micAlive || silenceSinceSpeechMs >= (double)postRollSilenceMs || elapsedMs >= (double)postRollMaxMs) {
             [timer invalidate];
             self.postRollTimer = nil;
             self.finalizePostRollEnd = CACurrentMediaTime();
@@ -2328,52 +2766,74 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             return;
         }
 
-        NSString *activeApp = @"";
-        BOOL focusedEditable = IsFocusedElementEditableText(&activeApp);
+        NSRunningApplication *frontApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        NSString *activeApp = frontApp.localizedName ?: @"";
+        NSString *frontBundleID = frontApp.bundleIdentifier ?: @"";
+#ifdef VOICEPTT_TEST
+        if (self.testFrontAppNameOverride) activeApp = self.testFrontAppNameOverride;
+        if (self.testFrontAppBundleIDOverride) frontBundleID = self.testFrontAppBundleIDOverride;
+#endif
 
-        [self runDecisionRouterAndRefinement:trimmed
-                                   activeApp:activeApp
-                             focusedEditable:focusedEditable
-                               audioDuration:totalAudioSec
-                                  completion:^(NSString *finalText, NSString *routeOverride, double drMs, double llmMs) {
+        void (^continueAfterFocusCheck)(BOOL) = ^(BOOL focusedEditable) {
             if (gen != self.sessionGen) return;
 
-            self.state = AppStateIdle;
-            self.committedText = @"";
-            self.liveTailText = @"";
-            self.liveCaptionText = @"";
+            [self runDecisionRouterAndRefinement:trimmed
+                                       activeApp:activeApp
+                                 focusedEditable:focusedEditable
+                                   audioDuration:totalAudioSec
+                                      completion:^(NSString *finalText, NSString *routeOverride, double drMs, double llmMs) {
+                if (gen != self.sessionGen) return;
 
-            NSString *preview = finalText.length > 60
-                ? [[finalText substringToIndex:60] stringByAppendingString:@"…"]
-                : finalText;
+                self.state = AppStateIdle;
+                self.committedText = @"";
+                self.liveTailText = @"";
+                self.liveCaptionText = @"";
 
-            if (finalText.length > 0 && ![routeOverride isEqualToString:@"discard"]) {
-                self.lastTranscript = finalText;
-                [self deliverFinalText:finalText
-                       focusedEditable:focusedEditable
-                         routeOverride:routeOverride
-                             onEmitted:^{
+                NSString *preview = finalText.length > 60
+                    ? [[finalText substringToIndex:60] stringByAppendingString:@"…"]
+                    : finalText;
+
+                if (finalText.length > 0 && ![routeOverride isEqualToString:@"discard"]) {
+                    self.lastTranscript = finalText;
+                    [self deliverFinalText:finalText
+                           focusedEditable:focusedEditable
+                             routeOverride:routeOverride
+                                 onEmitted:^{
+                        double totalMs = (CACurrentMediaTime() - self.finalizePipelineStart) * 1000.0;
+                        self.lastLatencySec = totalMs / 1000.0;
+                        NSString *logLine = [NSString stringWithFormat:
+                            @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms (tail=%.1fs, fastpath=%@) | dr=%.0fms | llm=%.0fms | out=%@ (%@) | \"%@\"",
+                            totalMs, postRollMs, waitStreamMs, whisperFinalMs, tailAudioSec,
+                            usedFastPath ? @"yes" : @"no", drMs, llmMs,
+                            self.lastOutputStatus ?: @"", activeApp.length > 0 ? activeApp : @"unknown", preview];
+                        [self appendLatencyLog:logLine];
+                    }];
+                } else if ([routeOverride isEqualToString:@"discard"]) {
                     double totalMs = (CACurrentMediaTime() - self.finalizePipelineStart) * 1000.0;
-                    self.lastLatencySec = totalMs / 1000.0;
+                    self.lastOutputStatus = @"Discarded (DR)";
                     NSString *logLine = [NSString stringWithFormat:
-                        @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms (tail=%.1fs, fastpath=%@) | dr=%.0fms | llm=%.0fms | out=%@ (%@) | \"%@\"",
-                        totalMs, postRollMs, waitStreamMs, whisperFinalMs, tailAudioSec,
-                        usedFastPath ? @"yes" : @"no", drMs, llmMs,
-                        self.lastOutputStatus ?: @"", activeApp.length > 0 ? activeApp : @"unknown", preview];
+                        @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms | dr=%.0fms | out=Discarded (DR)",
+                        totalMs, postRollMs, waitStreamMs, whisperFinalMs, drMs];
                     [self appendLatencyLog:logLine];
-                    [self rebuildMenu];
-                }];
-            } else if ([routeOverride isEqualToString:@"discard"]) {
-                double totalMs = (CACurrentMediaTime() - self.finalizePipelineStart) * 1000.0;
-                self.lastOutputStatus = @"Discarded (DR)";
-                NSString *logLine = [NSString stringWithFormat:
-                    @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms | dr=%.0fms | out=Discarded (DR)",
-                    totalMs, postRollMs, waitStreamMs, whisperFinalMs, drMs];
-                [self appendLatencyLog:logLine];
-                [self showToastWithHeader:@"Discarded by Decision Router" caption:nil dotColor:[NSColor systemGrayColor] duration:1.2];
-            }
-            [self updateUI];
-        }];
+                    [self showToastWithHeader:@"Discarded by Decision Router" caption:nil dotColor:[NSColor systemGrayColor] duration:1.2];
+                }
+                [self updateUI];
+            }];
+        };
+
+        // Fast paths avoid AX IPC completely; otherwise run AX queries off the main thread
+        if (IsKnownTerminalBundleID(frontBundleID)) {
+            continueAfterFocusCheck(YES);
+        } else if (self.outputMode != OutputModeSmartAuto && ![self isDecisionRouterEnabled]) {
+            continueAfterFocusCheck(NO);
+        } else {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                BOOL editable = IsFocusedElementEditableTextForBundleID(frontBundleID);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    continueAfterFocusCheck(editable);
+                });
+            });
+        }
     };
 
     // Fast path: if streaming already covered all speech up to (lastSpeech + 150ms), zero extra Whisper work!
@@ -2499,7 +2959,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     req.HTTPBody = body;
 
     NSTimeInterval drT0 = CACurrentMediaTime();
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+    NSURLSessionDataTask *task = [[self activeURLSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL shouldRefine = defaultShouldRefine;
         NSString *styleHint = @"prose";
         NSString *routeOverride = nil;
@@ -2593,7 +3053,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
     req.HTTPBody = body;
 
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+    NSURLSessionDataTask *task = [[self activeURLSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         NSString *result = nil;
         if (!err && data) {
             id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -2652,6 +3112,15 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
 
     self.lastOutputStatus = statusTag;
+
+#ifdef VOICEPTT_TEST
+    if (self.testDeliverTextHook) {
+        NSString *emitted = (shouldPaste && self.addTrailingSpace) ? [text stringByAppendingString:@" "] : text;
+        self.testDeliverTextHook(emitted, shouldPaste, statusTag);
+        if (onEmitted) onEmitted();
+        return;
+    }
+#endif
 
     if (shouldPaste) {
         NSString *toPaste = self.addTrailingSpace ? [text stringByAppendingString:@" "] : text;
@@ -2715,7 +3184,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
     req.HTTPBody = body;
 
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSURLSessionDataTask *task = [[self activeURLSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSString *cleaned = nil;
         NSArray<NSDictionary *> *segments = nil;
         if (!error && data) {
@@ -2860,6 +3329,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 @end
 
+#ifndef VOICEPTT_TEST
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
@@ -2870,3 +3340,4 @@ int main(int argc, const char * argv[]) {
     }
     return 0;
 }
+#endif

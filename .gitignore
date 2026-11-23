@@ -4,8 +4,11 @@
 
 # Build artifacts
 VoicePTT.app/
+build/
 *.o
 *.dSYM/
+*.profraw
+*.profdata
 
 # Downloaded Whisper / VAD model weights
 models/*.bin

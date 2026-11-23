@@ -41,6 +41,10 @@ jobs:
           zsh -n build.sh
           zsh -n scripts/setup.sh
           zsh -n scripts/download-models.sh
+          zsh -n scripts/test.sh
+
+      - name: Run unit & regression tests with coverage
+        run: ./scripts/test.sh --coverage
 
       - name: Get whisper.cpp submodule SHA
         id: submodule
