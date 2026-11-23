@@ -71,7 +71,6 @@ static NSString * const kPrefGatePresetKey = @"VoicePTTGatePresetV2";
 static NSString * const kPrefLiveCaptionKey = @"VoicePTTLiveCaption";
 
 static const NSInteger kServerPort = 8178;
-static const NSInteger kPreviewServerPort = 8179;
 static const uint32_t kSampleRate = 16000;
 static const uint64_t kRingCapacitySamples = 16000ULL * 180ULL; // 3 minutes continuous PCM (~5.76 MB)
 static const NSUInteger kIdleRMSRingSize = 120;                 // 6 seconds of 50ms chunks
@@ -447,7 +446,7 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 // -----------------------------------------------------------------------------
 // Main App Controller
 // -----------------------------------------------------------------------------
-@interface VoicePTTApp : NSObject <NSApplicationDelegate> {
+@interface VoicePTTApp : NSObject <NSApplicationDelegate, NSMenuDelegate> {
 @public
     AudioQueueRef _audioQueue;
     AudioQueueBufferRef _audioBuffers[4];
@@ -466,6 +465,8 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
     // Active extraction markers
     BOOL _isCapturingSession;
     uint64_t _captureStartSample;
+    uint64_t _committedSample;
+    uint64_t _captureLastSpeechSample;
     float _capturePeakRMS;
 
     CFMachPortRef _eventTap;
@@ -481,8 +482,6 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 @property (nonatomic, strong) NSPanel *osdPanel;
 @property (nonatomic, strong) LiveOSDView *osdView;
 @property (nonatomic, strong) NSTask *serverTask;
-@property (nonatomic, strong) NSTask *previewServerTask;
-@property (nonatomic, assign) BOOL previewServerReady;
 @property (nonatomic, strong) NSLock *audioLock;
 @property (nonatomic, assign) AppState state;
 @property (nonatomic, assign) PTTMode mode;
@@ -500,17 +499,24 @@ static BOOL IsFocusedElementEditableText(NSString **outAppName) {
 @property (nonatomic, assign) BOOL otherKeyPressedDuringHold;
 @property (nonatomic, assign) NSTimeInterval holdStartTime;
 @property (nonatomic, assign) NSTimeInterval lastShortTapReleaseTime;
+@property (nonatomic, copy) NSString *committedText;
+@property (nonatomic, copy) NSString *liveTailText;
 @property (nonatomic, copy) NSString *liveCaptionText;
 @property (nonatomic, copy) NSString *lastTranscript;
 @property (nonatomic, copy) NSString *lastOutputStatus;
 @property (nonatomic, assign) double lastLatencySec;
 @property (nonatomic, strong) NSTimer *permPollTimer;
 @property (nonatomic, strong) NSTimer *healthTimer;
-@property (nonatomic, strong) NSTimer *livePreviewTimer;
+@property (nonatomic, strong) NSTimer *streamTimer;
+@property (nonatomic, strong) NSTimer *postRollTimer;
 @property (nonatomic, strong) NSTimer *toastTimer;
 @property (nonatomic, strong) NSTimer *audioRestartTimer;
-@property (nonatomic, assign) BOOL previewInFlight;
-@property (nonatomic, assign) uint64_t lastPreviewSampleCount;
+@property (nonatomic, assign) BOOL streamPassInFlight;
+@property (nonatomic, assign) uint64_t lastStreamPassEndSample;
+@property (nonatomic, assign) BOOL finalizePending;
+@property (nonatomic, assign) uint64_t finalizeEndSample;
+@property (nonatomic, assign) NSTimeInterval finalizePipelineStart;
+@property (nonatomic, assign) NSTimeInterval finalizePostRollEnd;
 @property (nonatomic, assign) NSUInteger sessionGen;
 @property (nonatomic, assign) BOOL serverReady;
 @property (nonatomic, copy) NSString *baseDir;
@@ -555,10 +561,15 @@ static void AudioInputCallback(void *inUserData,
         }
         app->_ringTotalSamples += count;
 
+        gateThresh = [app effectiveGateThresholdLocked];
+
         if (app->_isCapturingSession) {
             isCapturing = YES;
             if (rms > app->_capturePeakRMS) {
                 app->_capturePeakRMS = rms;
+            }
+            if (rms >= gateThresh) {
+                app->_captureLastSpeechSample = app->_ringTotalSamples;
             }
         } else {
             // Track rolling ambient noise floor during idle periods (30th percentile)
@@ -581,7 +592,6 @@ static void AudioInputCallback(void *inUserData,
             }
         }
 
-        gateThresh = [app effectiveGateThresholdLocked];
         shouldReenqueue = YES;
     }
     [app.audioLock unlock];
@@ -705,12 +715,19 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     self.state = AppStateStarting;
     self.serverReady = NO;
 
+    NSFileManager *fm = [NSFileManager defaultManager];
     NSString *bundleParent = [[[NSBundle mainBundle] bundlePath] stringByDeletingLastPathComponent];
-    NSString *fallbackDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Downloads/voice-ptt"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:[bundleParent stringByAppendingPathComponent:@"models"]]) {
-        self.baseDir = bundleParent;
-    } else {
-        self.baseDir = fallbackDir;
+    NSString *bundleResources = [[NSBundle mainBundle] resourcePath] ?: @"";
+    NSString *appSupport = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/VoicePTT"];
+    NSString *configDir = [NSHomeDirectory() stringByAppendingPathComponent:@".config/voice-ptt"];
+
+    NSArray<NSString *> *searchBases = @[ bundleParent, bundleResources, appSupport, configDir ];
+    self.baseDir = bundleParent;
+    for (NSString *cand in searchBases) {
+        if (cand.length > 0 && [fm fileExistsAtPath:[cand stringByAppendingPathComponent:@"models"]]) {
+            self.baseDir = cand;
+            break;
+        }
     }
 
     [self loadPreferences];
@@ -724,7 +741,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    [self stopLivePreviewTimer];
+    [self stopStreamTimer];
+    [self.postRollTimer invalidate];
     [self.toastTimer invalidate];
     [self.audioRestartTimer invalidate];
     [self teardownAudioLifecycleObservers];
@@ -736,9 +754,6 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
     if (self.serverTask && self.serverTask.isRunning) {
         [self.serverTask terminate];
-    }
-    if (self.previewServerTask && self.previewServerTask.isRunning) {
-        [self.previewServerTask terminate];
     }
     [self.audioLock lock];
     if (_ringSamples) {
@@ -772,9 +787,21 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     if (savedModel && [[NSFileManager defaultManager] fileExistsAtPath:savedModel] && ![savedModel.lastPathComponent containsString:@"silero"]) {
         self.selectedModelPath = savedModel;
     } else {
-        NSString *mediumPath = [self.baseDir stringByAppendingPathComponent:@"models/ggml-medium.en-q5_0.bin"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:mediumPath]) {
-            self.selectedModelPath = mediumPath;
+        NSArray<NSString *> *preferred = @[
+            @"models/ggml-large-v3-turbo-q5_0.bin",
+            @"models/ggml-medium.en-q5_0.bin",
+            @"models/ggml-small.en-q5_1.bin"
+        ];
+        NSString *picked = nil;
+        for (NSString *rel in preferred) {
+            NSString *full = [self.baseDir stringByAppendingPathComponent:rel];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
+                picked = full;
+                break;
+            }
+        }
+        if (picked) {
+            self.selectedModelPath = picked;
         } else {
             NSArray<NSString *> *models = [self availableModels];
             self.selectedModelPath = models.firstObject ?: [self.baseDir stringByAppendingPathComponent:@"models/ggml-small.en-q5_1.bin"];
@@ -803,7 +830,9 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 - (NSDictionary *)defaultPipelineConfig {
     return @{
         @"pre_roll_ms": @300,
-        @"post_roll_ms": @200,
+        @"post_roll_min_ms": @350,
+        @"post_roll_silence_ms": @450,
+        @"post_roll_max_ms": @1800,
         @"adaptive_gate_multiplier": @2.6,
         @"adaptive_gate_min": @0.012,
         @"adaptive_gate_max": @0.11,
@@ -890,22 +919,41 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return nil;
 }
 
-- (NSString *)fastPreviewModelPath {
-    NSString *modelsDir = [self.baseDir stringByAppendingPathComponent:@"models"];
-    NSArray *candidates = @[ @"ggml-base.en-q5_1.bin", @"ggml-tiny.en-q5_1.bin", @"ggml-base.en.bin", @"ggml-small.en-q5_1.bin" ];
-    for (NSString *name in candidates) {
-        NSString *p = [modelsDir stringByAppendingPathComponent:name];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
-    }
-    return nil;
-}
-
 - (NSString *)promptFilePath {
     NSString *path = [[self configDirPath] stringByAppendingPathComponent:@"prompt.txt"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     return path;
+}
+
+- (NSString *)latencyLogPath {
+    return [[self configDirPath] stringByAppendingPathComponent:@"latency.log"];
+}
+
+- (void)appendLatencyLog:(NSString *)line {
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+    NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], line];
+    fprintf(stderr, "%s", entry.UTF8String);
+    fflush(stderr);
+
+    NSString *path = [self latencyLogPath];
+    NSData *data = [entry dataUsingEncoding:NSUTF8StringEncoding];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [data writeToFile:path atomically:YES];
+    } else {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:data];
+            [fh closeFile];
+        }
+    }
 }
 
 - (NSString *)loadCustomPrompt {
@@ -1044,7 +1092,14 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 - (void)setupStatusItem {
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.title = @"⏳";
-    [self rebuildMenu];
+    NSMenu *menu = [NSMenu new];
+    menu.delegate = self;
+    self.statusItem.menu = menu;
+    [self populateMenu:menu];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [self populateMenu:menu];
 }
 
 - (void)setupFloatingOSD {
@@ -1169,7 +1224,13 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)rebuildMenu {
-    NSMenu *menu = [NSMenu new];
+    if (self.statusItem.menu) {
+        [self populateMenu:self.statusItem.menu];
+    }
+}
+
+- (void)populateMenu:(NSMenu *)menu {
+    [menu removeAllItems];
 
     NSString *statusLine = nil;
     if (!AXIsProcessTrusted()) {
@@ -1358,7 +1419,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     mediaToggle.state = self.captureMediaButton ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:mediaToggle];
 
-    NSMenuItem *liveToggle = [[NSMenuItem alloc] initWithTitle:@"Live Caption OSD While Speaking" action:@selector(toggleLiveCaption:) keyEquivalent:@""];
+    NSMenuItem *liveToggle = [[NSMenuItem alloc] initWithTitle:@"Live Incremental Streaming (Single Model)" action:@selector(toggleLiveCaption:) keyEquivalent:@""];
     liveToggle.target = self;
     liveToggle.state = self.liveCaptionEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:liveToggle];
@@ -1386,8 +1447,6 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit VoicePTT" action:@selector(quitApp:) keyEquivalent:@"q"];
     quitItem.target = self;
     [menu addItem:quitItem];
-
-    self.statusItem.menu = menu;
 }
 
 #pragma mark - Menu Actions
@@ -1535,12 +1594,9 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         [self.serverTask terminate];
         [self.serverTask waitUntilExit];
     }
-    if (self.previewServerTask && self.previewServerTask.isRunning) {
-        [self.previewServerTask terminate];
-        [self.previewServerTask waitUntilExit];
-    }
     self.serverReady = NO;
-    self.previewServerReady = NO;
+    self.streamPassInFlight = NO;
+    self.finalizePending = NO;
     self.state = AppStateStarting;
     [self updateUI];
     [self startWhisperServer];
@@ -1550,7 +1606,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [NSApp terminate:nil];
 }
 
-#pragma mark - Whisper Server Lifecycle
+#pragma mark - Whisper Server Lifecycle (Single Model Incremental Engine)
 
 - (void)startWhisperServer {
     NSString *bundledBin = [[NSBundle mainBundle] pathForResource:@"whisper-server" ofType:nil];
@@ -1568,7 +1624,10 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         cores32 = 6;
     }
 
-    // Note: NO -nf (allow temperature fallback to break repetition loops!) + -mc 0 (no looping context)
+    // Single dedicated model server:
+    // - No -nt so verbose_json includes segment timestamps for sliding commits
+    // - -nlp skips slow language auto-detection in verbose_json
+    // - -mc 64 enables custom prompt.txt + incremental prefix context without looping
     NSMutableArray *args = [NSMutableArray arrayWithArray:@[
         @"-m", self.selectedModelPath,
         @"--host", @"127.0.0.1",
@@ -1576,9 +1635,9 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         @"-t", [NSString stringWithFormat:@"%d", cores32],
         @"-bo", @"1",
         @"-bs", @"1",
-        @"-mc", @"0",
+        @"-mc", @"64",
         @"-l", @"en",
-        @"-nt",
+        @"-nlp",
         @"-sns",
         @"-nth", @"0.65"
     ]];
@@ -1607,60 +1666,6 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return;
     }
     self.serverTask = task;
-
-    // Launch dedicated fast preview server (base.en ~220ms) on separate port so live OSD never blocks final pass
-    NSString *previewModel = [self fastPreviewModelPath];
-    if (previewModel) {
-        NSMutableArray *pArgs = [NSMutableArray arrayWithArray:@[
-            @"-m", previewModel,
-            @"--host", @"127.0.0.1",
-            @"--port", [NSString stringWithFormat:@"%ld", (long)kPreviewServerPort],
-            @"-t", @"4",
-            @"-bo", @"1",
-            @"-bs", @"1",
-            @"-mc", @"0",
-            @"-l", @"en",
-            @"-nt",
-            @"-sns",
-            @"-nth", @"0.65"
-        ]];
-        if (vadPath) {
-            [pArgs addObjectsFromArray:@[
-                @"--vad",
-                @"-vm", vadPath,
-                @"-vt", @"0.58",
-                @"-vspd", @"180",
-                @"-vp", @"60"
-            ]];
-        }
-        NSTask *pTask = [NSTask new];
-        pTask.launchPath = serverBin;
-        pTask.arguments = pArgs;
-        pTask.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-        pTask.standardError = [NSFileHandle fileHandleWithNullDevice];
-        NSError *pErr = nil;
-        [pTask launchAndReturnError:&pErr];
-        if (!pErr) {
-            self.previewServerTask = pTask;
-            __block int retries = 0;
-            [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES block:^(NSTimer * _Nonnull pTimer) {
-                retries++;
-                if (retries > 30 || self.previewServerReady) {
-                    [pTimer invalidate];
-                    return;
-                }
-                NSURL *pUrl = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld/", (long)kPreviewServerPort]];
-                [[[NSURLSession sharedSession] dataTaskWithURL:pUrl completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-                    if (!e && r) {
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            self.previewServerReady = YES;
-                            [pTimer invalidate];
-                        });
-                    }
-                }] resume];
-            }];
-        }
-    }
 
     [self.healthTimer invalidate];
     self.healthTimer = [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES block:^(NSTimer * _Nonnull timer) {
@@ -1729,6 +1734,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     _idleRMSCount = 0;
     _isCapturingSession = NO;
     _captureStartSample = 0;
+    _committedSample = 0;
+    _captureLastSpeechSample = 0;
     _capturePeakRMS = 0.0f;
     _audioQueueRunning = YES;
     [self.audioLock unlock];
@@ -1815,19 +1822,27 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     uint64_t preRollSamples = (uint64_t)((preRollMs * kSampleRate) / 1000);
 
     self.sessionGen++;
+    [self.postRollTimer invalidate];
+    self.postRollTimer = nil;
+    self.committedText = @"";
+    self.liveTailText = @"";
     self.liveCaptionText = @"";
-    self.lastPreviewSampleCount = 0;
+    self.lastStreamPassEndSample = 0;
+    self.finalizePending = NO;
+    self.finalizeEndSample = 0;
 
     [self.audioLock lock];
     uint64_t nowSample = _ringTotalSamples;
     uint64_t earliest = (nowSample > kRingCapacitySamples) ? (nowSample - kRingCapacitySamples) : 0;
     _captureStartSample = (nowSample > earliest + preRollSamples) ? (nowSample - preRollSamples) : earliest;
+    _committedSample = _captureStartSample;
+    _captureLastSpeechSample = 0;
     _capturePeakRMS = 0.0f;
     _isCapturingSession = YES;
     [self.audioLock unlock];
 
     self.state = newState;
-    [self startLivePreviewTimer];
+    [self startStreamTimer];
     [self updateUI];
 }
 
@@ -1881,11 +1896,15 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
 
     if (self.mode == PTTModeSmart && heldDuration < 0.25) {
-        [self stopLivePreviewTimer];
+        self.sessionGen++;
+        [self stopStreamTimer];
         [self.audioLock lock];
         _isCapturingSession = NO;
         [self.audioLock unlock];
+        self.committedText = @"";
+        self.liveTailText = @"";
         self.liveCaptionText = @"";
+        self.finalizePending = NO;
         self.lastShortTapReleaseTime = CACurrentMediaTime();
         self.state = AppStateIdle;
         [self updateUI];
@@ -1906,74 +1925,209 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (void)cancelRecording {
     self.sessionGen++;
-    [self stopLivePreviewTimer];
+    [self stopStreamTimer];
+    [self.postRollTimer invalidate];
+    self.postRollTimer = nil;
     [self.audioLock lock];
     _isCapturingSession = NO;
     [self.audioLock unlock];
+    self.committedText = @"";
+    self.liveTailText = @"";
     self.liveCaptionText = @"";
+    self.finalizePending = NO;
     self.lastShortTapReleaseTime = 0;
     self.state = AppStateIdle;
     [self updateUI];
 }
 
-#pragma mark - Live Caption Preview Timer
+#pragma mark - Single-Model Incremental Streaming
 
-- (void)startLivePreviewTimer {
-    [self stopLivePreviewTimer];
-    if (!self.liveCaptionEnabled || !self.showPill) return;
+- (NSString *)joinTranscriptPrefix:(NSString *)prefix withSuffix:(NSString *)suffix {
+    NSString *a = [prefix stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    NSString *b = [suffix stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    if (a.length == 0) return b;
+    if (b.length == 0) return a;
 
-    self.livePreviewTimer = [NSTimer scheduledTimerWithTimeInterval:0.40 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        [self runLiveCaptionPreview];
+    // Guard against 1-word overlap at chunk commit boundaries
+    NSArray<NSString *> *aWords = [a componentsSeparatedByString:@" "];
+    NSArray<NSString *> *bWords = [b componentsSeparatedByString:@" "];
+    if (aWords.count >= 1 && bWords.count >= 2) {
+        NSString *lastA = [aWords.lastObject.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet punctuationCharacterSet]];
+        NSString *firstB = [bWords.firstObject.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet punctuationCharacterSet]];
+        if (lastA.length > 0 && [lastA isEqualToString:firstB]) {
+            b = [[bWords subarrayWithRange:NSMakeRange(1, bWords.count - 1)] componentsJoinedByString:@" "];
+            if (b.length == 0) return a;
+        }
+    }
+    return [NSString stringWithFormat:@"%@ %@", a, b];
+}
+
+- (NSString *)assembledTranscript {
+    return [self joinTranscriptPrefix:self.committedText withSuffix:self.liveTailText];
+}
+
+- (NSString *)buildStreamingPrompt {
+    NSString *custom = [self loadCustomPrompt];
+    NSString *committed = self.committedText ?: @"";
+    if (committed.length > 220) {
+        committed = [committed substringFromIndex:committed.length - 220];
+        NSRange sp = [committed rangeOfString:@" "];
+        if (sp.location != NSNotFound && sp.location + 1 < committed.length) {
+            committed = [committed substringFromIndex:sp.location + 1];
+        }
+    }
+    if (custom.length > 0 && committed.length > 0) {
+        return [NSString stringWithFormat:@"%@ %@", custom, committed];
+    }
+    return committed.length > 0 ? committed : custom;
+}
+
+- (void)startStreamTimer {
+    [self stopStreamTimer];
+    if (!self.liveCaptionEnabled) return;
+
+    self.streamTimer = [NSTimer scheduledTimerWithTimeInterval:0.55 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        [self runStreamingPass];
     }];
 }
 
-- (void)stopLivePreviewTimer {
-    [self.livePreviewTimer invalidate];
-    self.livePreviewTimer = nil;
+- (void)stopStreamTimer {
+    [self.streamTimer invalidate];
+    self.streamTimer = nil;
 }
 
-- (void)runLiveCaptionPreview {
-    if (self.previewInFlight || (self.state != AppStateHolding && self.state != AppStateLocked)) return;
+- (void)runStreamingPass {
+    if (self.streamPassInFlight || self.finalizePending || (self.state != AppStateHolding && self.state != AppStateLocked)) return;
 
-    uint64_t startSample = 0;
-    uint64_t endSample = 0;
+    uint64_t tailStart = 0;
+    uint64_t nowSample = 0;
+    uint64_t lastSpeech = 0;
     float peak = 0.0f;
     float gateThresh = 0.025f;
 
     [self.audioLock lock];
-    if (_isCapturingSession && _ringTotalSamples > _captureStartSample) {
-        uint64_t totalCaptured = _ringTotalSamples - _captureStartSample;
-        // Require >= 0.5s total and >= 0.25s new samples since last preview
-        if (totalCaptured >= (kSampleRate / 2) && (totalCaptured - self.lastPreviewSampleCount >= (kSampleRate / 4))) {
-            uint64_t maxPreviewSamples = (uint64_t)kSampleRate * 10ULL;
-            endSample = _ringTotalSamples;
-            startSample = (totalCaptured > maxPreviewSamples) ? (endSample - maxPreviewSamples) : _captureStartSample;
-            self.lastPreviewSampleCount = totalCaptured;
-            peak = _capturePeakRMS;
-            gateThresh = [self effectiveGateThresholdLocked];
-        }
+    if (_isCapturingSession && _ringTotalSamples > _committedSample) {
+        tailStart = _committedSample;
+        nowSample = _ringTotalSamples;
+        lastSpeech = _captureLastSpeechSample;
+        peak = _capturePeakRMS;
+        gateThresh = [self effectiveGateThresholdLocked];
     }
     [self.audioLock unlock];
 
-    if (endSample <= startSample || peak < gateThresh) return;
+    if (nowSample <= tailStart || peak < gateThresh || lastSpeech <= tailStart) return;
 
-    NSData *snapshot = [self sliceRingPCMFromSample:startSample toSample:endSample];
+    uint64_t tailSamples = nowSample - tailStart;
+    double tailDurationSec = (double)tailSamples / (double)kSampleRate;
+
+    // Avoid mid-flight contention on short 1-4.5s bursts:
+    // Only stream incrementally once the speaker either pauses cleanly (>= 400ms silence after >= 1.2s tail)
+    // OR speaks continuously past 4.5s (long hands-free dictation).
+    BOOL pauseReady = (tailDurationSec >= 1.2) &&
+                      (nowSample >= lastSpeech + (uint64_t)(kSampleRate * 40 / 100));
+    BOOL longSpeechReady = (tailDurationSec >= 4.5);
+    if (!pauseReady && !longSpeechReady) return;
+
+    // Avoid redundant passes during silence: require >= 0.45s new audio AND speech not already covered
+    if (self.lastStreamPassEndSample > tailStart) {
+        uint64_t newSinceLast = (nowSample > self.lastStreamPassEndSample) ? (nowSample - self.lastStreamPassEndSample) : 0;
+        if (newSinceLast < (uint64_t)(kSampleRate * 45 / 100)) return;
+        if (lastSpeech + (uint64_t)(kSampleRate * 45 / 100) <= self.lastStreamPassEndSample) return;
+    }
+
+    NSData *snapshot = [self sliceRingPCMFromSample:tailStart toSample:nowSample];
     if (!snapshot) return;
 
     NSData *filtered = [self applyHighPassFilterPCM:snapshot];
-    NSData *gated = [self applyNoiseGateAndTrimPCM:filtered threshold:gateThresh];
+    NSUInteger trimStartSamples = 0;
+    NSUInteger lastSpeechOffsetInSlice = 0;
+    NSData *gated = [self applyNoiseGateAndTrimPCM:filtered
+                                         threshold:gateThresh
+                               outTrimStartSamples:&trimStartSamples
+                               outLastSpeechSample:&lastSpeechOffsetInSlice];
     if (!gated || gated.length < (kSampleRate * 2 / 3)) return;
 
-    self.previewInFlight = YES;
-    NSUInteger gen = self.sessionGen;
+    double gatedDurationSec = (double)gated.length / ((double)kSampleRate * 2.0);
+    BOOL needSegments = (!pauseReady && tailDurationSec >= 8.0);
 
-    [self sendPCMToWhisper:gated isPreview:YES completion:^(NSString *cleaned, double elapsed) {
-        self.previewInFlight = NO;
-        if (gen == self.sessionGen && (self.state == AppStateHolding || self.state == AppStateLocked)) {
-            if (cleaned.length > 0) {
-                self.liveCaptionText = cleaned;
-                [self updateUI];
+    self.streamPassInFlight = YES;
+    NSUInteger gen = self.sessionGen;
+    NSString *prompt = [self buildStreamingPrompt];
+
+    [self sendPCMToWhisper:gated prompt:prompt needSegments:needSegments completion:^(NSString *cleaned, NSArray<NSDictionary *> *segments, double elapsed) {
+        self.streamPassInFlight = NO;
+        if (gen != self.sessionGen) return;
+
+        self.lastStreamPassEndSample = nowSample;
+
+        if (cleaned.length > 0) {
+            // Trigger A: Clean pause commit (>= 1.2s tail with >= 400ms trailing below-gate silence)
+            BOOL hasCleanTrailingPause = (tailDurationSec >= 1.2) &&
+                                         (lastSpeechOffsetInSlice > 0) &&
+                                         (tailSamples >= (uint64_t)lastSpeechOffsetInSlice + (uint64_t)(kSampleRate * 40 / 100));
+
+            if (hasCleanTrailingPause) {
+                self.committedText = [self joinTranscriptPrefix:self.committedText withSuffix:cleaned];
+                self.liveTailText = @"";
+                uint64_t nextCommit = tailStart + (uint64_t)lastSpeechOffsetInSlice + (uint64_t)(kSampleRate * 15 / 100);
+                if (nextCommit > nowSample) nextCommit = nowSample;
+                [self.audioLock lock];
+                if (nextCommit > _committedSample) {
+                    _committedSample = nextCommit;
+                }
+                [self.audioLock unlock];
+            } else if (tailDurationSec >= 8.0 && segments.count >= 2) {
+                // Trigger B: Long continuous speech commit via verbose_json segment timestamps
+                NSInteger commitIdx = -1;
+                double commitEndSec = 0.0;
+                for (NSInteger i = 0; i < (NSInteger)segments.count - 1; i++) {
+                    NSDictionary *seg = segments[i];
+                    if ([seg isKindOfClass:[NSDictionary class]] && [seg[@"end"] respondsToSelector:@selector(doubleValue)]) {
+                        double segEnd = [seg[@"end"] doubleValue];
+                        if (segEnd > 0.5 && segEnd <= (gatedDurationSec - 1.5)) {
+                            commitIdx = i;
+                            commitEndSec = segEnd;
+                        }
+                    }
+                }
+                if (commitIdx >= 0) {
+                    NSMutableArray<NSString *> *headParts = [NSMutableArray array];
+                    NSMutableArray<NSString *> *tailParts = [NSMutableArray array];
+                    for (NSInteger i = 0; i < (NSInteger)segments.count; i++) {
+                        NSString *t = [segments[i][@"text"] isKindOfClass:[NSString class]] ? segments[i][@"text"] : @"";
+                        if (i <= commitIdx) [headParts addObject:t];
+                        else [tailParts addObject:t];
+                    }
+                    NSString *headClean = [self sanitizeTranscript:[headParts componentsJoinedByString:@" "]];
+                    NSString *tailClean = [self sanitizeTranscript:[tailParts componentsJoinedByString:@" "]];
+                    if (headClean.length > 0) {
+                        self.committedText = [self joinTranscriptPrefix:self.committedText withSuffix:headClean];
+                        self.liveTailText = tailClean;
+                        uint64_t nextCommit = tailStart + (uint64_t)trimStartSamples + (uint64_t)llround(commitEndSec * (double)kSampleRate);
+                        if (nextCommit > nowSample) nextCommit = nowSample;
+                        [self.audioLock lock];
+                        if (nextCommit > _committedSample) {
+                            _committedSample = nextCommit;
+                        }
+                        [self.audioLock unlock];
+                    } else {
+                        self.liveTailText = cleaned;
+                    }
+                } else {
+                    self.liveTailText = cleaned;
+                }
+            } else {
+                self.liveTailText = cleaned;
             }
+        }
+
+        self.liveCaptionText = [self assembledTranscript];
+        if (self.state == AppStateHolding || self.state == AppStateLocked) {
+            [self updateUI];
+        }
+
+        if (self.finalizePending) {
+            [self runFinalizeStepForGen:gen];
         }
     }];
 }
@@ -2006,7 +2160,13 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return out;
 }
 
-- (NSData *)applyNoiseGateAndTrimPCM:(NSData *)pcm threshold:(float)thresh {
+- (NSData *)applyNoiseGateAndTrimPCM:(NSData *)pcm
+                           threshold:(float)thresh
+                 outTrimStartSamples:(NSUInteger *)outTrimStartSamples
+                 outLastSpeechSample:(NSUInteger *)outLastSpeechSample {
+    if (outTrimStartSamples) *outTrimStartSamples = 0;
+    if (outLastSpeechSample) *outLastSpeechSample = 0;
+
     const int16_t *src = (const int16_t *)pcm.bytes;
     NSUInteger totalSamples = pcm.length / sizeof(int16_t);
     if (totalSamples < 320) return nil;
@@ -2047,6 +2207,9 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     NSUInteger endWin = (NSUInteger)MIN((NSInteger)numWins, lastSpeechWin + 15);
     NSUInteger outSamples = (endWin - startWin) * win;
 
+    if (outTrimStartSamples) *outTrimStartSamples = startWin * win;
+    if (outLastSpeechSample) *outLastSpeechSample = (NSUInteger)(lastSpeechWin + 1) * win;
+
     NSMutableData *out = [NSMutableData dataWithLength:outSamples * sizeof(int16_t)];
     int16_t *dst = (int16_t *)out.mutableBytes;
 
@@ -2063,93 +2226,197 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return out;
 }
 
-#pragma mark - Extraction, Transcription, Decision Router & LLM Refinement
+#pragma mark - Extraction, Finalization, Decision Router & LLM Refinement
 
 - (void)finishRecordingAndTranscribe {
-    self.sessionGen++;
+    // Keep sessionGen intact so an in-flight streaming pass hands off cleanly instead of being discarded
     NSUInteger gen = self.sessionGen;
-    [self stopLivePreviewTimer];
+    [self stopStreamTimer];
+    [self.postRollTimer invalidate];
+    self.postRollTimer = nil;
 
     NSDictionary *cfg = [self loadPipelineConfig];
-    NSInteger postRollMs = cfg[@"post_roll_ms"] ? [cfg[@"post_roll_ms"] integerValue] : 200;
-    postRollMs = MAX(0, MIN(1000, postRollMs));
+    NSInteger postRollMinMs = cfg[@"post_roll_min_ms"] ? [cfg[@"post_roll_min_ms"] integerValue] : 350;
+    NSInteger postRollSilenceMs = cfg[@"post_roll_silence_ms"] ? [cfg[@"post_roll_silence_ms"] integerValue] : 450;
+    NSInteger postRollMaxMs = cfg[@"post_roll_max_ms"] ? [cfg[@"post_roll_max_ms"] integerValue] : 1800;
+    postRollMinMs = MAX(100, MIN(2000, postRollMinMs));
+    postRollSilenceMs = MAX(150, MIN(2000, postRollSilenceMs));
+    postRollMaxMs = MAX(postRollMinMs, MIN(4000, postRollMaxMs));
 
+    NSTimeInterval releaseTime = CACurrentMediaTime();
+    self.finalizePipelineStart = releaseTime;
     self.state = AppStateTranscribing;
     [self updateUI];
 
-    NSTimeInterval pipelineStart = CACurrentMediaTime();
+    // Speech-tail-aware post-roll: keep listening briefly until silence settles (or max cap)
+    // so releasing the key slightly early never chops the final word.
+    self.postRollTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        if (gen != self.sessionGen) {
+            [timer invalidate];
+            return;
+        }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(postRollMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-        if (gen != self.sessionGen) return;
+        double elapsedMs = (CACurrentMediaTime() - releaseTime) * 1000.0;
+        if (elapsedMs < (double)postRollMinMs) {
+            return;
+        }
 
-        uint64_t startSample = 0;
-        uint64_t endSample = 0;
-        float peak = 0.0f;
-        float gateThresh = 0.025f;
-
+        uint64_t nowSample = 0;
+        uint64_t lastSpeech = 0;
         [self.audioLock lock];
-        startSample = _captureStartSample;
-        endSample = _ringTotalSamples;
-        peak = _capturePeakRMS;
-        gateThresh = [self effectiveGateThresholdLocked];
-        _isCapturingSession = NO;
+        nowSample = _ringTotalSamples;
+        lastSpeech = _captureLastSpeechSample;
         [self.audioLock unlock];
 
-        NSData *pcm = [self sliceRingPCMFromSample:startSample toSample:endSample];
-        if (!pcm || pcm.length < (kSampleRate * 2 / 4) || peak < gateThresh) {
-            self.liveCaptionText = @"";
-            self.state = AppStateIdle;
-            [self updateUI];
-            return;
-        }
+        double silenceSinceSpeechMs = (lastSpeech > 0 && nowSample >= lastSpeech)
+            ? ((double)(nowSample - lastSpeech) * 1000.0 / (double)kSampleRate)
+            : 9999.0;
 
-        NSData *filteredPCM = [self applyHighPassFilterPCM:pcm];
-        NSData *gatedPCM = [self applyNoiseGateAndTrimPCM:filteredPCM threshold:gateThresh];
-        if (!gatedPCM || gatedPCM.length < (kSampleRate * 2 / 5)) {
-            self.liveCaptionText = @"";
-            self.state = AppStateIdle;
-            [self updateUI];
-            return;
-        }
+        if (silenceSinceSpeechMs >= (double)postRollSilenceMs || elapsedMs >= (double)postRollMaxMs) {
+            [timer invalidate];
+            self.postRollTimer = nil;
+            self.finalizePostRollEnd = CACurrentMediaTime();
 
-        double audioDurationSec = (double)gatedPCM.length / ((double)kSampleRate * 2.0);
+            [self.audioLock lock];
+            self.finalizeEndSample = _ringTotalSamples;
+            _isCapturingSession = NO;
+            [self.audioLock unlock];
 
-        [self sendPCMToWhisper:gatedPCM isPreview:NO completion:^(NSString *cleaned, double asrElapsed) {
-            if (gen != self.sessionGen) return;
-            if (cleaned.length == 0) {
-                self.state = AppStateIdle;
-                self.liveCaptionText = @"";
-                [self updateUI];
-                return;
+            self.finalizePending = YES;
+            if (!self.streamPassInFlight) {
+                [self runFinalizeStepForGen:gen];
             }
+        }
+    }];
+}
 
-            // Snapshot focus context now (right before DR / LLM / Output)
-            NSString *activeApp = @"";
-            BOOL focusedEditable = IsFocusedElementEditableText(&activeApp);
+- (void)runFinalizeStepForGen:(NSUInteger)gen {
+    if (gen != self.sessionGen || !self.finalizePending) return;
+    self.finalizePending = NO;
 
-            [self runDecisionRouterAndRefinement:cleaned
-                                       activeApp:activeApp
-                                 focusedEditable:focusedEditable
-                                   audioDuration:audioDurationSec
-                                      completion:^(NSString *finalText, NSString *routeOverride) {
-                if (gen != self.sessionGen) return;
+    NSTimeInterval streamWaitEnd = CACurrentMediaTime();
+    double postRollMs = (self.finalizePostRollEnd - self.finalizePipelineStart) * 1000.0;
+    double waitStreamMs = MAX(0.0, (streamWaitEnd - self.finalizePostRollEnd) * 1000.0);
 
-                double totalElapsed = CACurrentMediaTime() - pipelineStart;
-                self.state = AppStateIdle;
-                self.liveCaptionText = @"";
+    uint64_t startSample = 0;
+    uint64_t commitSample = 0;
+    uint64_t endSample = self.finalizeEndSample;
+    uint64_t lastSpeech = 0;
+    float peak = 0.0f;
+    float gateThresh = 0.025f;
 
-                if (finalText.length > 0 && ![routeOverride isEqualToString:@"discard"]) {
-                    self.lastTranscript = finalText;
-                    self.lastLatencySec = totalElapsed;
-                    [self deliverFinalText:finalText focusedEditable:focusedEditable routeOverride:routeOverride];
-                } else if ([routeOverride isEqualToString:@"discard"]) {
-                    self.lastOutputStatus = @"Discarded (DR)";
-                    [self showToastWithHeader:@"Discarded by Decision Router" caption:nil dotColor:[NSColor systemGrayColor] duration:1.2];
-                }
-                [self updateUI];
-            }];
+    [self.audioLock lock];
+    startSample = _captureStartSample;
+    commitSample = _committedSample;
+    lastSpeech = _captureLastSpeechSample;
+    peak = _capturePeakRMS;
+    gateThresh = [self effectiveGateThresholdLocked];
+    [self.audioLock unlock];
+
+    double totalAudioSec = (endSample > startSample) ? ((double)(endSample - startSample) / (double)kSampleRate) : 0.0;
+    double tailAudioSec = (endSample > commitSample) ? ((double)(endSample - commitSample) / (double)kSampleRate) : 0.0;
+
+    void (^finishWithRawTranscript)(NSString *, double, BOOL) = ^(NSString *rawAssembled, double whisperFinalMs, BOOL usedFastPath) {
+        if (gen != self.sessionGen) return;
+        NSString *trimmed = [rawAssembled stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+        if (trimmed.length == 0) {
+            self.state = AppStateIdle;
+            self.committedText = @"";
+            self.liveTailText = @"";
+            self.liveCaptionText = @"";
+            [self updateUI];
+            return;
+        }
+
+        NSString *activeApp = @"";
+        BOOL focusedEditable = IsFocusedElementEditableText(&activeApp);
+
+        [self runDecisionRouterAndRefinement:trimmed
+                                   activeApp:activeApp
+                             focusedEditable:focusedEditable
+                               audioDuration:totalAudioSec
+                                  completion:^(NSString *finalText, NSString *routeOverride, double drMs, double llmMs) {
+            if (gen != self.sessionGen) return;
+
+            self.state = AppStateIdle;
+            self.committedText = @"";
+            self.liveTailText = @"";
+            self.liveCaptionText = @"";
+
+            NSString *preview = finalText.length > 60
+                ? [[finalText substringToIndex:60] stringByAppendingString:@"…"]
+                : finalText;
+
+            if (finalText.length > 0 && ![routeOverride isEqualToString:@"discard"]) {
+                self.lastTranscript = finalText;
+                [self deliverFinalText:finalText
+                       focusedEditable:focusedEditable
+                         routeOverride:routeOverride
+                             onEmitted:^{
+                    double totalMs = (CACurrentMediaTime() - self.finalizePipelineStart) * 1000.0;
+                    self.lastLatencySec = totalMs / 1000.0;
+                    NSString *logLine = [NSString stringWithFormat:
+                        @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms (tail=%.1fs, fastpath=%@) | dr=%.0fms | llm=%.0fms | out=%@ (%@) | \"%@\"",
+                        totalMs, postRollMs, waitStreamMs, whisperFinalMs, tailAudioSec,
+                        usedFastPath ? @"yes" : @"no", drMs, llmMs,
+                        self.lastOutputStatus ?: @"", activeApp.length > 0 ? activeApp : @"unknown", preview];
+                    [self appendLatencyLog:logLine];
+                    [self rebuildMenu];
+                }];
+            } else if ([routeOverride isEqualToString:@"discard"]) {
+                double totalMs = (CACurrentMediaTime() - self.finalizePipelineStart) * 1000.0;
+                self.lastOutputStatus = @"Discarded (DR)";
+                NSString *logLine = [NSString stringWithFormat:
+                    @"total=%.0fms | post_roll=%.0fms | wait_stream=%.0fms | whisper=%.0fms | dr=%.0fms | out=Discarded (DR)",
+                    totalMs, postRollMs, waitStreamMs, whisperFinalMs, drMs];
+                [self appendLatencyLog:logLine];
+                [self showToastWithHeader:@"Discarded by Decision Router" caption:nil dotColor:[NSColor systemGrayColor] duration:1.2];
+            }
+            [self updateUI];
         }];
-    });
+    };
+
+    // Fast path: if streaming already covered all speech up to (lastSpeech + 150ms), zero extra Whisper work!
+    NSString *alreadyAssembled = [self assembledTranscript];
+    BOOL speechAlreadyCovered = (self.lastStreamPassEndSample > 0) &&
+                                (lastSpeech > 0) &&
+                                (self.lastStreamPassEndSample >= lastSpeech + (uint64_t)(kSampleRate * 15 / 100));
+    if (speechAlreadyCovered && alreadyAssembled.length > 0) {
+        finishWithRawTranscript(alreadyAssembled, 0.0, YES);
+        return;
+    }
+
+    // Otherwise run ONE final pass on ONLY the uncommitted tail [commitSample, endSample)
+    if (endSample <= commitSample || peak < gateThresh) {
+        finishWithRawTranscript(alreadyAssembled, 0.0, YES);
+        return;
+    }
+
+    NSData *tailPCM = [self sliceRingPCMFromSample:commitSample toSample:endSample];
+    if (!tailPCM || tailPCM.length < (kSampleRate * 2 / 4)) {
+        finishWithRawTranscript(alreadyAssembled, 0.0, YES);
+        return;
+    }
+
+    NSData *filteredPCM = [self applyHighPassFilterPCM:tailPCM];
+    NSData *gatedPCM = [self applyNoiseGateAndTrimPCM:filteredPCM
+                                            threshold:gateThresh
+                                  outTrimStartSamples:NULL
+                                  outLastSpeechSample:NULL];
+    if (!gatedPCM || gatedPCM.length < (kSampleRate * 2 / 5)) {
+        finishWithRawTranscript(alreadyAssembled, 0.0, YES);
+        return;
+    }
+
+    NSString *prompt = [self buildStreamingPrompt];
+    [self sendPCMToWhisper:gatedPCM prompt:prompt needSegments:NO completion:^(NSString *tailCleaned, NSArray<NSDictionary *> *segments, double asrElapsed) {
+        if (gen != self.sessionGen) return;
+        NSString *combined = [self joinTranscriptPrefix:self.committedText withSuffix:tailCleaned];
+        if (combined.length == 0) {
+            combined = alreadyAssembled;
+        }
+        finishWithRawTranscript(combined, asrElapsed * 1000.0, NO);
+    }];
 }
 
 // Stage 3A: Decision Router (Intern-Decision HTTP interface) -> Stage 3B: OpenAI-Compat LLM Refiner
@@ -2157,26 +2424,28 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                              activeApp:(NSString *)activeApp
                        focusedEditable:(BOOL)focusedEditable
                          audioDuration:(double)audioDuration
-                            completion:(void (^)(NSString *finalText, NSString *routeOverride))completion {
+                            completion:(void (^)(NSString *finalText, NSString *routeOverride, double drMs, double llmMs))completion {
     NSDictionary *cfg = self.pipelineConfig ?: [self defaultPipelineConfig];
     NSDictionary *drCfg = [cfg[@"decision_router"] isKindOfClass:[NSDictionary class]] ? cfg[@"decision_router"] : nil;
     NSDictionary *llmCfg = [cfg[@"llm"] isKindOfClass:[NSDictionary class]] ? cfg[@"llm"] : nil;
 
-    void (^proceedToLLM)(BOOL, NSString *, NSString *) = ^(BOOL shouldRefine, NSString *styleHint, NSString *routeOverride) {
+    void (^proceedToLLM)(BOOL, NSString *, NSString *, double) = ^(BOOL shouldRefine, NSString *styleHint, NSString *routeOverride, double drMs) {
         if ([routeOverride isEqualToString:@"discard"]) {
-            completion(rawText, @"discard");
+            completion(rawText, @"discard", drMs, 0.0);
             return;
         }
         if (!shouldRefine || ![llmCfg[@"enabled"] boolValue]) {
-            completion(rawText, routeOverride);
+            completion(rawText, routeOverride, drMs, 0.0);
             return;
         }
+        NSTimeInterval llmT0 = CACurrentMediaTime();
         [self refineTextWithOpenAICompatLLM:rawText
                                   activeApp:activeApp
                                   styleHint:styleHint
                                      config:llmCfg
                                  completion:^(NSString *refined) {
-            completion(refined.length > 0 ? refined : rawText, routeOverride);
+            double llmMs = (CACurrentMediaTime() - llmT0) * 1000.0;
+            completion(refined.length > 0 ? refined : rawText, routeOverride, drMs, llmMs);
         }];
     };
 
@@ -2190,14 +2459,14 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     BOOL defaultShouldRefine = [llmCfg[@"enabled"] boolValue] && (wordCount >= minWords);
 
     if (!drCfg || ![drCfg[@"enabled"] boolValue]) {
-        proceedToLLM(defaultShouldRefine, @"prose", nil);
+        proceedToLLM(defaultShouldRefine, @"prose", nil, 0.0);
         return;
     }
 
     NSString *endpoint = drCfg[@"endpoint_url"];
     NSURL *url = endpoint.length > 0 ? [NSURL URLWithString:endpoint] : nil;
     if (!url) {
-        proceedToLLM(defaultShouldRefine, @"prose", nil);
+        proceedToLLM(defaultShouldRefine, @"prose", nil, 0.0);
         return;
     }
 
@@ -2219,7 +2488,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (!body) {
-        proceedToLLM(defaultShouldRefine, @"prose", nil);
+        proceedToLLM(defaultShouldRefine, @"prose", nil, 0.0);
         return;
     }
 
@@ -2229,10 +2498,12 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     req.HTTPBody = body;
 
+    NSTimeInterval drT0 = CACurrentMediaTime();
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL shouldRefine = defaultShouldRefine;
         NSString *styleHint = @"prose";
         NSString *routeOverride = nil;
+        double drMs = (CACurrentMediaTime() - drT0) * 1000.0;
 
         if (!err && data) {
             id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -2257,7 +2528,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            proceedToLLM(shouldRefine, styleHint, routeOverride);
+            proceedToLLM(shouldRefine, styleHint, routeOverride, drMs);
         });
     }];
     [task resume];
@@ -2355,7 +2626,10 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [task resume];
 }
 
-- (void)deliverFinalText:(NSString *)text focusedEditable:(BOOL)focusedEditable routeOverride:(NSString *)routeOverride {
+- (void)deliverFinalText:(NSString *)text
+         focusedEditable:(BOOL)focusedEditable
+           routeOverride:(NSString *)routeOverride
+               onEmitted:(void (^)(void))onEmitted {
     BOOL shouldPaste = NO;
     NSString *statusTag = @"Pasted";
 
@@ -2381,28 +2655,29 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     if (shouldPaste) {
         NSString *toPaste = self.addTrailingSpace ? [text stringByAppendingString:@" "] : text;
-        [self pasteTextPreservingClipboard:toPaste];
+        [self pasteTextPreservingClipboard:toPaste onPosted:onEmitted];
     } else {
         [self copyTextToClipboard:text];
+        if (onEmitted) onEmitted();
         [self showToastWithHeader:@"Copied to Clipboard ✓" caption:text dotColor:[NSColor systemGreenColor] duration:1.8];
     }
 }
 
-- (void)sendPCMToWhisper:(NSData *)pcm isPreview:(BOOL)isPreview completion:(void (^)(NSString *cleaned, double elapsed))completion {
+- (void)sendPCMToWhisper:(NSData *)pcm
+                  prompt:(NSString *)prompt
+            needSegments:(BOOL)needSegments
+              completion:(void (^)(NSString *cleaned, NSArray<NSDictionary *> *segments, double elapsed))completion {
     double durationSec = (double)pcm.length / ((double)kSampleRate * 2.0);
-    // Safe dynamic audio_ctx: tighter for fast base.en preview, generous for final medium.en pass
+    // Dynamic audio_ctx: keep generous minimum (384) so large-v3-turbo doesn't echo/loop short phrases
     NSInteger audioCtx = 0;
     if (durationSec < 22.0) {
-        double pad = isPreview ? 1.5 : 2.5;
-        NSInteger minCtx = isPreview ? 256 : 384;
-        NSInteger frames = (NSInteger)ceil((durationSec + pad) * 50.0);
+        NSInteger frames = (NSInteger)ceil((durationSec + 2.0) * 50.0);
         audioCtx = ((frames + 63) / 64) * 64;
-        if (audioCtx < minCtx) audioCtx = minCtx;
+        if (audioCtx < 384) audioCtx = 384;
         if (audioCtx >= 1500) audioCtx = 0;
     }
 
     NSData *wavData = BuildWAVData(pcm);
-    NSString *prompt = isPreview ? @"" : [self loadCustomPrompt];
     NSTimeInterval t0 = CACurrentMediaTime();
 
     NSString *boundary = [NSString stringWithFormat:@"----VoicePTT%@", [[NSUUID UUID] UUIDString]];
@@ -2420,7 +2695,11 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     appendField(@"temperature_inc", @"0.2"); // allows Whisper to break repetition loops!
     appendField(@"entropy_thold", @"2.2");
     appendField(@"no_speech_thold", @"0.65");
-    appendField(@"response_format", @"json");
+    // Keep segment timestamps enabled (large-v3-turbo needs them to emit EOT cleanly without repeating),
+    // but disable expensive per-token cross-attention timestamps.
+    appendField(@"no_timestamps", @"false");
+    appendField(@"token_timestamps", @"false");
+    appendField(@"response_format", needSegments ? @"verbose_json" : @"json");
     if (audioCtx > 0) {
         appendField(@"audio_ctx", [NSString stringWithFormat:@"%ld", (long)audioCtx]);
     }
@@ -2429,8 +2708,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
     [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
 
-    NSInteger targetPort = (isPreview && self.previewServerReady) ? kPreviewServerPort : kServerPort;
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld/inference", (long)targetPort]];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld/inference", (long)kServerPort]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     req.timeoutInterval = 30.0;
@@ -2439,15 +2717,21 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSString *cleaned = nil;
+        NSArray<NSDictionary *> *segments = nil;
         if (!error && data) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([json isKindOfClass:[NSDictionary class]] && [json[@"text"] isKindOfClass:[NSString class]]) {
-                cleaned = [self sanitizeTranscript:json[@"text"]];
+            if ([json isKindOfClass:[NSDictionary class]]) {
+                if ([json[@"text"] isKindOfClass:[NSString class]]) {
+                    cleaned = [self sanitizeTranscript:json[@"text"]];
+                }
+                if ([json[@"segments"] isKindOfClass:[NSArray class]]) {
+                    segments = json[@"segments"];
+                }
             }
         }
         double elapsed = CACurrentMediaTime() - t0;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(cleaned ?: @"", elapsed);
+            if (completion) completion(cleaned ?: @"", segments ?: @[], elapsed);
         });
     }];
     [task resume];
@@ -2527,7 +2811,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [pb setString:text forType:NSPasteboardTypeString];
 }
 
-- (void)pasteTextPreservingClipboard:(NSString *)text {
+- (void)pasteTextPreservingClipboard:(NSString *)text onPosted:(void (^)(void))onPosted {
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
 
     NSMutableArray<NSDictionary<NSPasteboardType, NSData *> *> *savedItems = [NSMutableArray array];
@@ -2555,6 +2839,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         CFRelease(vDown);
         CFRelease(vUp);
         if (src) CFRelease(src);
+        if (onPosted) onPosted();
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             if (pb.changeCount == ourChangeCount && savedItems.count > 0) {

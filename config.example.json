@@ -1,0 +1,30 @@
+{
+  "pre_roll_ms": 300,
+  "post_roll_min_ms": 350,
+  "post_roll_silence_ms": 450,
+  "post_roll_max_ms": 1800,
+  "adaptive_gate_multiplier": 2.6,
+  "adaptive_gate_min": 0.012,
+  "adaptive_gate_max": 0.11,
+  "llm": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:11434/v1",
+    "api_key": "",
+    "model": "qwen2.5:3b",
+    "timeout_sec": 12.0,
+    "temperature": 0.0,
+    "min_words_to_refine": 4,
+    "system_prompt": "You clean up speech-to-text transcriptions. Fix obvious ASR mishearings, punctuation, capitalization, and spoken self-corrections (e.g., 'no wait, make that...'). Preserve the speaker's exact meaning and wording. Never answer questions or add commentary. Output ONLY the cleaned text."
+  },
+  "decision_router": {
+    "enabled": false,
+    "endpoint_url": "http://127.0.0.1:8180/decide",
+    "model": "Intern-Decision-2B",
+    "timeout_sec": 2.5,
+    "schema": {
+      "needs_refine": ["yes", "no"],
+      "output_action": ["paste", "clipboard", "discard"],
+      "style": ["prose", "code", "command"]
+    }
+  }
+}
