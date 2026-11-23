@@ -22,9 +22,13 @@ jobs:
           - os: macos-15
             arch: arm64
             metal: "ON"
+            extra_cmake: "-DGGML_NATIVE=OFF"
           - os: macos-15-intel
             arch: x86_64
             metal: "OFF"
+            # Portable x86_64 baseline (AVX + F16C, no AVX2/FMA) so builds run on
+            # older Intel Macs too (e.g. Late 2013 Mac Pro Xeon E5 / Ivy Bridge)
+            extra_cmake: "-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_F16C=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_AVX512=OFF"
 
     steps:
       - name: Checkout repository + whisper.cpp submodule
@@ -47,25 +51,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: whisper.cpp/build/bin/whisper-server
-          key: whisper-server-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.submodule.outputs.sha }}
+          key: whisper-server-macos12-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.submodule.outputs.sha }}
 
       - name: Build static whisper-server
         if: steps.cache-whisper.outputs.cache-hit != 'true'
         run: |
           cmake -B whisper.cpp/build -S whisper.cpp \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DBUILD_SHARED_LIBS=OFF \
             -DWHISPER_BUILD_SERVER=ON \
             -DWHISPER_BUILD_TESTS=OFF \
             -DGGML_ACCELERATE=ON \
             -DGGML_METAL=${{ matrix.metal }} \
-            -DGGML_METAL_EMBED_LIBRARY=${{ matrix.metal }}
+            -DGGML_METAL_EMBED_LIBRARY=${{ matrix.metal }} \
+            ${{ matrix.extra_cmake }}
           cmake --build whisper.cpp/build --target whisper-server -j "$(sysctl -n hw.ncpu)"
 
       - name: Build VoicePTT.app
         run: ./build.sh
 
-      - name: Verify app bundle, architecture & code signature
+      - name: Verify app bundle, architecture, macOS 12 target & signature
         run: |
           test -x VoicePTT.app/Contents/MacOS/VoicePTT
           test -x VoicePTT.app/Contents/Resources/whisper-server
@@ -73,6 +79,8 @@ jobs:
           file VoicePTT.app/Contents/Resources/whisper-server
           file VoicePTT.app/Contents/MacOS/VoicePTT | grep -q "${{ matrix.arch }}"
           file VoicePTT.app/Contents/Resources/whisper-server | grep -q "${{ matrix.arch }}"
+          otool -l VoicePTT.app/Contents/MacOS/VoicePTT | grep -A3 LC_BUILD_VERSION | grep -q "minos 12.0"
+          otool -l VoicePTT.app/Contents/Resources/whisper-server | grep -A3 LC_BUILD_VERSION | grep -q "minos 12.0"
           codesign --verify --deep --strict --verbose=2 VoicePTT.app
 
       - name: Package build artifact
