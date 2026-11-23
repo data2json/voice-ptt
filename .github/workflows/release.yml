@@ -73,6 +73,9 @@ jobs:
             ${{ matrix.extra_cmake }}
           cmake --build whisper.cpp/build --target whisper-server -j "$(sysctl -n hw.ncpu)"
 
+      - name: Run unit & regression tests with coverage
+        run: ./scripts/test.sh --coverage
+
       - name: Build VoicePTT.app
         env:
           APP_VERSION: ${{ steps.ver.outputs.version }}
