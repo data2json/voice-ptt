@@ -77,7 +77,7 @@ Zero Electron, zero Python runtime dependencies — just a single Objective-C Co
 ### Option B: Build from Source
 
 ```bash
-git clone --recurse-submodules <your-repo-url> voice-ptt
+git clone --recurse-submodules https://github.com/data2json/voice-ptt.git
 cd voice-ptt
 
 # 1. Build static whisper-server and download Silero VAD + Whisper model
