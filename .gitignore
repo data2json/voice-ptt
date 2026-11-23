@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+._*
+
+# Build artifacts
+VoicePTT.app/
+*.o
+*.dSYM/
+
+# Downloaded Whisper / VAD model weights
+models/*.bin
+models/*.gguf
+models/*.mlmodelc/
+
+# Logs and temporary audio
+*.log
+*.wav
