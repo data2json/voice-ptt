@@ -58,6 +58,24 @@ Zero Electron, zero Python runtime dependencies — just a single Objective-C Co
 
 ## Quick Start
 
+### Option A: Download Prebuilt Release (No Xcode/CMake needed)
+
+1. Download the archive for your Mac from **GitHub Releases**:
+   - **Apple Silicon (M1/M2/M3/M4)**: `VoicePTT-*-macos-arm64.zip` *(built with Metal GPU acceleration)*
+   - **Intel Mac**: `VoicePTT-*-macos-x86_64.zip` *(built with Accelerate)*
+2. Unzip, drag `VoicePTT.app` to `/Applications` (or keep it anywhere), and download a Whisper + Silero VAD model:
+   ```bash
+   ./download-models.sh                  # large-v3-turbo-q5_0 (best accuracy)
+   # or: ./download-models.sh small.en-q5_1  (fastest on Intel CPU)
+   ```
+3. Since prebuilt releases are ad-hoc signed, clear the macOS quarantine attribute on first launch:
+   ```bash
+   xattr -dr com.apple.quarantine VoicePTT.app
+   open VoicePTT.app
+   ```
+
+### Option B: Build from Source
+
 ```bash
 git clone --recurse-submodules <your-repo-url> voice-ptt
 cd voice-ptt
@@ -73,11 +91,24 @@ cd voice-ptt
 open VoicePTT.app
 ```
 
+### Permissions
+
 On first launch, macOS will ask for two permissions:
 1. **Microphone** — to capture audio into the ring buffer.
 2. **Accessibility** (*System Settings → Privacy & Security → Accessibility*) — for global hotkeys, focus detection, and `Cmd+V` paste injection.
 
 *(Note: After rebuilding and ad-hoc signing `VoicePTT.app`, macOS may require toggling VoicePTT off/on once in Accessibility settings.)*
+
+---
+
+## CI & Automated Releases (GitHub Actions)
+
+- **CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))**: Runs on every push and PR to `main`, building and verifying `VoicePTT.app` on both **Apple Silicon (`macos-15`)** and **Intel (`macos-15-intel`)** with cached `whisper-server` builds, `codesign --verify`, and downloadable `.zip` artifacts.
+- **Releases ([`.github/workflows/release.yml`](.github/workflows/release.yml))**: Push any `v*` tag (or trigger manually via **Actions → Release**) to automatically build both `arm64` and `x86_64` archives + `SHA256SUMS.txt` and publish a GitHub Release:
+  ```bash
+  git tag v1.0.0
+  git push origin v1.0.0
+  ```
 
 ---
 

@@ -1,0 +1,92 @@
+name: Build & Verify (macOS)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            metal: "ON"
+          - os: macos-15-intel
+            arch: x86_64
+            metal: "OFF"
+
+    steps:
+      - name: Checkout repository + whisper.cpp submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Lint shell scripts
+        run: |
+          zsh -n build.sh
+          zsh -n scripts/setup.sh
+          zsh -n scripts/download-models.sh
+
+      - name: Get whisper.cpp submodule SHA
+        id: submodule
+        run: echo "sha=$(git rev-parse HEAD:whisper.cpp)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache whisper-server build
+        id: cache-whisper
+        uses: actions/cache@v4
+        with:
+          path: whisper.cpp/build/bin/whisper-server
+          key: whisper-server-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.submodule.outputs.sha }}
+
+      - name: Build static whisper-server
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        run: |
+          cmake -B whisper.cpp/build -S whisper.cpp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DGGML_ACCELERATE=ON \
+            -DGGML_METAL=${{ matrix.metal }} \
+            -DGGML_METAL_EMBED_LIBRARY=${{ matrix.metal }}
+          cmake --build whisper.cpp/build --target whisper-server -j "$(sysctl -n hw.ncpu)"
+
+      - name: Build VoicePTT.app
+        run: ./build.sh
+
+      - name: Verify app bundle, architecture & code signature
+        run: |
+          test -x VoicePTT.app/Contents/MacOS/VoicePTT
+          test -x VoicePTT.app/Contents/Resources/whisper-server
+          file VoicePTT.app/Contents/MacOS/VoicePTT
+          file VoicePTT.app/Contents/Resources/whisper-server
+          file VoicePTT.app/Contents/MacOS/VoicePTT | grep -q "${{ matrix.arch }}"
+          file VoicePTT.app/Contents/Resources/whisper-server | grep -q "${{ matrix.arch }}"
+          codesign --verify --deep --strict --verbose=2 VoicePTT.app
+
+      - name: Package build artifact
+        run: |
+          mkdir -p dist/VoicePTT
+          cp -R VoicePTT.app dist/VoicePTT/
+          cp scripts/download-models.sh dist/VoicePTT/
+          cp config.example.json dist/VoicePTT/
+          chmod +x dist/VoicePTT/download-models.sh
+          ditto -c -k --sequesterRsrc --keepParent dist/VoicePTT "VoicePTT-macos-${{ matrix.arch }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoicePTT-macos-${{ matrix.arch }}
+          path: VoicePTT-macos-${{ matrix.arch }}.zip
+          retention-days: 14

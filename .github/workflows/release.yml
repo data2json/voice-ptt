@@ -1,0 +1,127 @@
+name: Release (macOS arm64 + x86_64)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            metal: "ON"
+          - os: macos-15-intel
+            arch: x86_64
+            metal: "OFF"
+
+    steps:
+      - name: Checkout repository + whisper.cpp submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Get whisper.cpp submodule SHA
+        id: submodule
+        run: echo "sha=$(git rev-parse HEAD:whisper.cpp)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache whisper-server build
+        id: cache-whisper
+        uses: actions/cache@v4
+        with:
+          path: whisper.cpp/build/bin/whisper-server
+          key: whisper-server-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.submodule.outputs.sha }}
+
+      - name: Build static whisper-server
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        run: |
+          cmake -B whisper.cpp/build -S whisper.cpp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DGGML_ACCELERATE=ON \
+            -DGGML_METAL=${{ matrix.metal }} \
+            -DGGML_METAL_EMBED_LIBRARY=${{ matrix.metal }}
+          cmake --build whisper.cpp/build --target whisper-server -j "$(sysctl -n hw.ncpu)"
+
+      - name: Build VoicePTT.app
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: ./build.sh
+
+      - name: Verify app bundle & signature
+        run: |
+          file VoicePTT.app/Contents/MacOS/VoicePTT | grep -q "${{ matrix.arch }}"
+          file VoicePTT.app/Contents/Resources/whisper-server | grep -q "${{ matrix.arch }}"
+          codesign --verify --deep --strict --verbose=2 VoicePTT.app
+
+      - name: Package release archive
+        run: |
+          STAGE="dist/VoicePTT-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}"
+          mkdir -p "$STAGE"
+          cp -R VoicePTT.app "$STAGE/"
+          cp scripts/download-models.sh "$STAGE/"
+          cp config.example.json "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          chmod +x "$STAGE/download-models.sh"
+          ditto -c -k --sequesterRsrc --keepParent "$STAGE" "VoicePTT-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}.zip"
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: VoicePTT-*.zip
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum VoicePTT-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" artifacts/VoicePTT-*.zip artifacts/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "VoicePTT $TAG" \
+            --generate-notes || \
+          gh release upload "$TAG" artifacts/VoicePTT-*.zip artifacts/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --clobber

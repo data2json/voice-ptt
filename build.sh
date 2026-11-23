@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/VoicePTT.app"
 WHISPER_SERVER="$ROOT/whisper.cpp/build/bin/whisper-server"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+APP_VERSION="${APP_VERSION:-}"
 
 if [[ ! -x "$WHISPER_SERVER" ]]; then
   echo "Error: whisper-server binary not found at $WHISPER_SERVER" >&2
@@ -12,10 +13,16 @@ if [[ ! -x "$WHISPER_SERVER" ]]; then
   exit 1
 fi
 
-if [[ -x "/Library/Developer/CommandLineTools/usr/bin/clang" ]]; then
-  CLANG="/Library/Developer/CommandLineTools/usr/bin/clang"
-else
-  CLANG="$(command -v clang)"
+CLANG=""
+if command -v xcrun >/dev/null 2>&1; then
+  CLANG="$(xcrun --find clang 2>/dev/null || true)"
+fi
+if [[ -z "$CLANG" || ! -x "$CLANG" ]]; then
+  if [[ -x "/Library/Developer/CommandLineTools/usr/bin/clang" ]]; then
+    CLANG="/Library/Developer/CommandLineTools/usr/bin/clang"
+  else
+    CLANG="$(command -v clang)"
+  fi
 fi
 
 SDK=""
@@ -58,6 +65,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
   -o "$APP/Contents/MacOS/VoicePTT"
 
 cp "$ROOT/src/Info.plist" "$APP/Contents/Info.plist"
+if [[ -n "$APP_VERSION" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$APP/Contents/Info.plist"
+fi
+
 cp "$WHISPER_SERVER" "$APP/Contents/Resources/whisper-server"
 chmod +x "$APP/Contents/MacOS/VoicePTT" "$APP/Contents/Resources/whisper-server"
 
