@@ -5,15 +5,17 @@
 #import <QuartzCore/QuartzCore.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <IOKit/hidsystem/ev_keymap.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
 #include <sys/sysctl.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <signal.h>
 
 typedef NS_ENUM(NSInteger, PTTMode) {
-    PTTModeSmart = 0,     // Hold to talk, OR quick double-tap to lock hands-free
-    PTTModeHoldOnly = 1,  // Strict hold-to-talk
-    PTTModeToggleOnly = 2 // Tap once to start, tap again to stop
+    PTTModeSmart = 0,      // Hold to talk, OR quick double-tap to lock hands-free
+    PTTModeHoldOnly = 1,   // Strict hold-to-talk
+    PTTModeToggleOnly = 2, // Tap once to start, tap again to stop
+    PTTModeDoubleTap = 3   // Double-tap to start, single-tap to send, double-tap while active to clear & start over
 };
 
 typedef NS_ENUM(NSInteger, OutputMode) {
@@ -34,17 +36,33 @@ typedef struct {
     CGKeyCode keyCode;
     BOOL isModifier;
     CGEventFlags modifierMask;
+    CGEventFlags deviceMask;
+    CGEventFlags devicePairMask;
     NSString *label;
 } HotkeyOption;
 
+// Keep indices 0..4 stable for backward-compatible NSUserDefaults; menu uses kHotkeyMenuOrder
 static const HotkeyOption kHotkeyOptions[] = {
-    { 61,  YES, kCGEventFlagMaskAlternate, @"Right Option (⌥)" },
-    { 54,  YES, kCGEventFlagMaskCommand,   @"Right Command (⌘)" },
-    { 62,  YES, kCGEventFlagMaskControl,   @"Right Control (⌃)" },
-    { 96,  NO,  0,                         @"F5" },
-    { 105, NO,  0,                         @"F13 (or Foot Pedal)" }
+    { 61,  YES, kCGEventFlagMaskAlternate, NX_DEVICERALTKEYMASK,   (NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK),     @"Right Option (⌥)" },
+    { 54,  YES, kCGEventFlagMaskCommand,   NX_DEVICERCMDKEYMASK,   (NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK),     @"Right Command (⌘)" },
+    { 62,  YES, kCGEventFlagMaskControl,   NX_DEVICERCTLKEYMASK,   (NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK),     @"Right Control (⌃)" },
+    { 96,  NO,  0,                         0,                      0,                                                 @"F5" },
+    { 105, NO,  0,                         0,                      0,                                                 @"F13 (or Foot Pedal)" },
+    { 58,  YES, kCGEventFlagMaskAlternate, NX_DEVICELALTKEYMASK,   (NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK),     @"Left Option (⌥)" },
+    { 55,  YES, kCGEventFlagMaskCommand,   NX_DEVICELCMDKEYMASK,   (NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK),     @"Left Command (⌘)" },
+    { 59,  YES, kCGEventFlagMaskControl,   NX_DEVICELCTLKEYMASK,   (NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK),     @"Left Control (⌃)" },
+    { 60,  YES, kCGEventFlagMaskShift,     NX_DEVICERSHIFTKEYMASK, (NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK), @"Right Shift (⇧)" },
+    { 56,  YES, kCGEventFlagMaskShift,     NX_DEVICELSHIFTKEYMASK, (NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK), @"Left Shift (⇧)" }
 };
-static const NSInteger kHotkeyOptionCount = 5;
+static const NSInteger kHotkeyOptionCount = 10;
+static const NSInteger kHotkeyMenuOrder[] = { 0, 5, 1, 6, 2, 7, 8, 9, 3, 4 };
+
+static inline BOOL IsHotkeyModifierDown(HotkeyOption hk, CGEventFlags flags) {
+    if ((flags & hk.devicePairMask) != 0) {
+        return (flags & hk.deviceMask) != 0;
+    }
+    return (flags & hk.modifierMask) != 0;
+}
 
 typedef struct {
     float threshold; // <= 0 means adaptive ambient noise floor
@@ -60,7 +78,7 @@ static const GatePreset kGatePresets[] = {
 };
 static const NSInteger kGatePresetCount = 5;
 
-static NSString * const kPrefModeKey = @"VoicePTTMode";
+static NSString * const kPrefModeKey = @"VoicePTTModeV2";
 static NSString * const kPrefOutputModeKey = @"VoicePTTOutputMode";
 static NSString * const kPrefHotkeyIndexKey = @"VoicePTTHotkeyIndex";
 static NSString * const kPrefMicUIDKey = @"VoicePTTMicUID";
@@ -481,6 +499,7 @@ static BOOL IsFocusedElementEditableTextForBundleID(NSString *bundleID) {
     _Atomic NSInteger _tapAppState;
     _Atomic BOOL _tapTriggerKeyIsDown;
     _Atomic BOOL _tapOtherKeyPressedDuringHold;
+    _Atomic BOOL _tapInterveningKeyPressed;
     _Atomic BOOL _tapShuttingDown;
     _Atomic int _tapTimeoutBurstCount;
     _Atomic double _tapTimeoutWindowStart;
@@ -526,6 +545,13 @@ static BOOL IsFocusedElementEditableTextForBundleID(NSString *bundleID) {
 @property (nonatomic, assign) BOOL captureMediaButton;
 @property (nonatomic, assign) NSTimeInterval holdStartTime;
 @property (nonatomic, assign) NSTimeInterval lastShortTapReleaseTime;
+@property (nonatomic, assign) NSTimeInterval tapDownTime;
+@property (nonatomic, assign) NSTimeInterval lastIdleSoloTapUpTime;
+@property (nonatomic, assign) BOOL awaitingSecondTapWhileIdle;
+@property (nonatomic, strong) NSTimer *pendingStopTimer;
+@property (nonatomic, assign) NSTimeInterval pendingStopReleaseTime;
+@property (nonatomic, assign) BOOL awaitingResetSecondTapUp;
+@property (nonatomic, assign) NSTimeInterval osdResetFlashUntil;
 @property (nonatomic, copy) NSString *committedText;
 @property (nonatomic, copy) NSString *liveTailText;
 @property (nonatomic, copy) NSString *liveCaptionText;
@@ -557,6 +583,7 @@ static BOOL IsFocusedElementEditableTextForBundleID(NSString *bundleID) {
 @property (nonatomic, copy) NSString *testFrontAppNameOverride;
 @property (nonatomic, copy) NSString *testFrontAppBundleIDOverride;
 @property (nonatomic, assign) NSTimeInterval testRetryDelayOverride;
+@property (nonatomic, assign) NSTimeInterval testPendingStopDelayOverride;
 #endif
 @end
 
@@ -708,6 +735,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
             atomic_store(&app->_tapTriggerKeyIsDown, NO);
             atomic_store(&app->_tapOtherKeyPressedDuringHold, NO);
+            atomic_store(&app->_tapInterveningKeyPressed, NO);
             if (atomic_load(&app->_tapShuttingDown)) {
                 return event;
             }
@@ -763,10 +791,10 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         CGKeyCode keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
         CGEventFlags flags = CGEventGetFlags(event);
 
-        // Esc cancels active recording without pasting
+        // Esc aborts active recording or pending finalization without pasting/copying
         if (type == kCGEventKeyDown && keyCode == 53) {
             AppState curState = (AppState)atomic_load(&app->_tapAppState);
-            if (curState == AppStateHolding || curState == AppStateLocked) {
+            if (curState == AppStateHolding || curState == AppStateLocked || curState == AppStateTranscribing) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [app cancelRecording];
                 });
@@ -781,7 +809,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
         if (hk.isModifier) {
             if (type == kCGEventFlagsChanged && keyCode == hk.keyCode) {
-                BOOL isNowDown = (flags & hk.modifierMask) != 0;
+                BOOL isNowDown = IsHotkeyModifierDown(hk, flags);
                 BOOL wasDown = atomic_load(&app->_tapTriggerKeyIsDown);
                 if (isNowDown && !wasDown) {
                     atomic_store(&app->_tapTriggerKeyIsDown, YES);
@@ -795,8 +823,11 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                         [app handleTriggerUp];
                     });
                 }
-            } else if (type == kCGEventKeyDown && atomic_load(&app->_tapTriggerKeyIsDown)) {
-                atomic_store(&app->_tapOtherKeyPressedDuringHold, YES);
+            } else if (type == kCGEventKeyDown) {
+                atomic_store(&app->_tapInterveningKeyPressed, YES);
+                if (atomic_load(&app->_tapTriggerKeyIsDown)) {
+                    atomic_store(&app->_tapOtherKeyPressedDuringHold, YES);
+                }
             }
         } else {
             if (keyCode == hk.keyCode) {
@@ -804,6 +835,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                     int64_t isRepeat = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat);
                     if (isRepeat == 0 && !atomic_load(&app->_tapTriggerKeyIsDown)) {
                         atomic_store(&app->_tapTriggerKeyIsDown, YES);
+                        atomic_store(&app->_tapOtherKeyPressedDuringHold, NO);
                         dispatch_async(dispatch_get_main_queue(), ^{
                             [app handleTriggerDown];
                         });
@@ -817,6 +849,11 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                         });
                     }
                     return NULL;
+                }
+            } else if (type == kCGEventKeyDown) {
+                atomic_store(&app->_tapInterveningKeyPressed, YES);
+                if (atomic_load(&app->_tapTriggerKeyIsDown)) {
+                    atomic_store(&app->_tapOtherKeyPressedDuringHold, YES);
                 }
             }
         }
@@ -877,6 +914,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     atomic_store(&_tapShuttingDown, NO);
     atomic_store(&_tapTriggerKeyIsDown, NO);
     atomic_store(&_tapOtherKeyPressedDuringHold, NO);
+    atomic_store(&_tapInterveningKeyPressed, NO);
     atomic_store(&_tapTimeoutBurstCount, 0);
     atomic_store(&_tapTimeoutWindowStart, 0.0);
     atomic_store(&_audioQueueRunningAtomic, NO);
@@ -918,6 +956,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     atomic_fetch_add(&_audioRestartGen, 1);
 
     [self stopStreamTimer];
+    [self.pendingStopTimer invalidate];
     [self.postRollTimer invalidate];
     [self.toastTimer invalidate];
     [self.permPollTimer invalidate];
@@ -962,7 +1001,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (void)loadPreferences {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    self.mode = [d objectForKey:kPrefModeKey] ? [d integerForKey:kPrefModeKey] : PTTModeSmart;
+    self.mode = [d objectForKey:kPrefModeKey] ? [d integerForKey:kPrefModeKey] : PTTModeDoubleTap;
+    if (self.mode < PTTModeSmart || self.mode > PTTModeDoubleTap) self.mode = PTTModeDoubleTap;
     self.outputMode = [d objectForKey:kPrefOutputModeKey] ? [d integerForKey:kPrefOutputModeKey] : OutputModeSmartAuto;
     self.hotkeyIndex = [d objectForKey:kPrefHotkeyIndexKey] ? [d integerForKey:kPrefHotkeyIndexKey] : 0;
     if (self.hotkeyIndex < 0 || self.hotkeyIndex >= kHotkeyOptionCount) self.hotkeyIndex = 0;
@@ -1503,7 +1543,14 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         self.statusItem.button.title = @"🔒";
         [self.toastTimer invalidate];
         self.toastTimer = nil;
-        [self showOSDWithHeader:@"Hands-Free  (tap to send · Esc cancel)" caption:self.liveCaptionText dotColor:[NSColor systemOrangeColor] showMeter:YES];
+        BOOL justReset = (CACurrentMediaTime() < self.osdResetFlashUntil);
+        NSString *hdr = justReset
+            ? @"Cleared — Recording Fresh…  (1× send · Esc abort)"
+            : (self.mode == PTTModeDoubleTap
+                ? @"Recording  (1× send · 2× clear · Esc abort)"
+                : @"Hands-Free  (tap to send · Esc cancel)");
+        NSColor *dot = justReset ? [NSColor systemGreenColor] : [NSColor systemOrangeColor];
+        [self showOSDWithHeader:hdr caption:self.liveCaptionText dotColor:dot showMeter:YES];
     } else if (self.state == AppStateTranscribing) {
         self.statusItem.button.title = @"⏳";
         [self.toastTimer invalidate];
@@ -1583,29 +1630,35 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     // Trigger Mode submenu
     NSMenuItem *modeParent = [[NSMenuItem alloc] initWithTitle:@"Trigger Mode" action:nil keyEquivalent:@""];
     NSMenu *modeMenu = [NSMenu new];
-    NSArray *modeTitles = @[
-        @"Smart (Hold to talk · Double-tap lock)",
-        @"Hold Only (Push-to-Talk)",
-        @"Tap-to-Toggle (No holding)"
+    NSArray<NSDictionary *> *modeEntries = @[
+        @{ @"tag": @(PTTModeDoubleTap),  @"title": @"Double-Tap (2× Start · 1× Send · 2× Clear)" },
+        @{ @"tag": @(PTTModeSmart),      @"title": @"Smart (Hold to talk · Double-tap lock)" },
+        @{ @"tag": @(PTTModeHoldOnly),   @"title": @"Hold Only (Push-to-Talk)" },
+        @{ @"tag": @(PTTModeToggleOnly), @"title": @"Tap-to-Toggle (No holding)" }
     ];
-    for (NSInteger i = 0; i < (NSInteger)modeTitles.count; i++) {
-        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:modeTitles[i] action:@selector(selectMode:) keyEquivalent:@""];
+    for (NSDictionary *entry in modeEntries) {
+        NSInteger tag = [entry[@"tag"] integerValue];
+        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:entry[@"title"] action:@selector(selectMode:) keyEquivalent:@""];
         it.target = self;
-        it.tag = i;
-        it.state = (self.mode == i) ? NSControlStateValueOn : NSControlStateValueOff;
+        it.tag = tag;
+        it.state = (self.mode == tag) ? NSControlStateValueOn : NSControlStateValueOff;
         [modeMenu addItem:it];
     }
     modeParent.submenu = modeMenu;
     [menu addItem:modeParent];
 
-    // Hotkey submenu
+    // Hotkey submenu (Left & Right modifiers grouped cleanly, followed by Function keys)
     NSMenuItem *hkParent = [[NSMenuItem alloc] initWithTitle:@"Hotkey" action:nil keyEquivalent:@""];
     NSMenu *hkMenu = [NSMenu new];
-    for (NSInteger i = 0; i < kHotkeyOptionCount; i++) {
-        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:kHotkeyOptions[i].label action:@selector(selectHotkey:) keyEquivalent:@""];
+    for (NSInteger pos = 0; pos < kHotkeyOptionCount; pos++) {
+        NSInteger idx = kHotkeyMenuOrder[pos];
+        if (!kHotkeyOptions[idx].isModifier && pos > 0 && kHotkeyOptions[kHotkeyMenuOrder[pos - 1]].isModifier) {
+            [hkMenu addItem:[NSMenuItem separatorItem]];
+        }
+        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:kHotkeyOptions[idx].label action:@selector(selectHotkey:) keyEquivalent:@""];
         it.target = self;
-        it.tag = i;
-        it.state = (self.hotkeyIndex == i) ? NSControlStateValueOn : NSControlStateValueOff;
+        it.tag = idx;
+        it.state = (self.hotkeyIndex == idx) ? NSControlStateValueOn : NSControlStateValueOff;
         [hkMenu addItem:it];
     }
     hkParent.submenu = hkMenu;
@@ -1785,15 +1838,26 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)selectMode:(NSMenuItem *)sender {
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingSecondTapWhileIdle = NO;
+    self.awaitingResetSecondTapUp = NO;
+    self.lastIdleSoloTapUpTime = 0;
     self.mode = (PTTMode)sender.tag;
     [[NSUserDefaults standardUserDefaults] setInteger:self.mode forKey:kPrefModeKey];
     [self updateUI];
 }
 
 - (void)selectHotkey:(NSMenuItem *)sender {
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingSecondTapWhileIdle = NO;
+    self.awaitingResetSecondTapUp = NO;
+    self.lastIdleSoloTapUpTime = 0;
     self.hotkeyIndex = sender.tag;
     atomic_store(&_tapTriggerKeyIsDown, NO);
     atomic_store(&_tapOtherKeyPressedDuringHold, NO);
+    atomic_store(&_tapInterveningKeyPressed, NO);
     [[NSUserDefaults standardUserDefaults] setInteger:self.hotkeyIndex forKey:kPrefHotkeyIndexKey];
     [self updateUI];
 }
@@ -2244,14 +2308,21 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)beginSessionWithState:(AppState)newState {
+    [self beginSessionWithState:newState includePreRoll:YES];
+}
+
+- (void)beginSessionWithState:(AppState)newState includePreRoll:(BOOL)includePreRoll {
     if (![self ensureContinuousMicReady]) return;
 
     NSDictionary *cfg = [self loadPipelineConfig];
-    NSInteger preRollMs = cfg[@"pre_roll_ms"] ? [cfg[@"pre_roll_ms"] integerValue] : 300;
+    NSInteger preRollMs = includePreRoll ? (cfg[@"pre_roll_ms"] ? [cfg[@"pre_roll_ms"] integerValue] : 300) : 0;
     preRollMs = MAX(0, MIN(2000, preRollMs));
     uint64_t preRollSamples = (uint64_t)((preRollMs * kSampleRate) / 1000);
 
     self.sessionGen++;
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingResetSecondTapUp = NO;
     [self.postRollTimer invalidate];
     self.postRollTimer = nil;
     self.committedText = @"";
@@ -2276,10 +2347,55 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     [self updateUI];
 }
 
+- (void)clearBufferAndRestartLockedSession {
+    self.osdResetFlashUntil = CACurrentMediaTime() + 0.90;
+    [self beginSessionWithState:AppStateLocked includePreRoll:NO];
+    NSUInteger gen = self.sessionGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(920 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        if (gen == self.sessionGen && self.state == AppStateLocked) {
+            [self updateUI];
+        }
+    });
+}
+
+- (void)commitPendingStopNow {
+    NSTimeInterval rel = self.pendingStopReleaseTime;
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingResetSecondTapUp = NO;
+    if (self.state == AppStateLocked) {
+        [self finishRecordingAndTranscribeFromReleaseTime:rel];
+    }
+}
+
 - (void)handleTriggerDown {
     if (!self.serverReady || self.state == AppStateTranscribing) return;
 
     NSTimeInterval now = CACurrentMediaTime();
+
+    if (self.mode == PTTModeDoubleTap) {
+        self.tapDownTime = now;
+        if (self.state == AppStateIdle) {
+            if (self.lastIdleSoloTapUpTime > 0 &&
+                (now - self.lastIdleSoloTapUpTime) < 0.40 &&
+                !atomic_load(&_tapInterveningKeyPressed)) {
+                self.awaitingSecondTapWhileIdle = YES;
+            } else {
+                self.awaitingSecondTapWhileIdle = NO;
+                self.lastIdleSoloTapUpTime = 0;
+            }
+        } else if (self.state == AppStateLocked && self.pendingStopTimer != nil) {
+            if (!atomic_load(&_tapInterveningKeyPressed)) {
+                // Second tap started inside the double-tap window — pause pending stop until keyUp confirms solo tap
+                [self.pendingStopTimer invalidate];
+                self.pendingStopTimer = nil;
+                self.awaitingResetSecondTapUp = YES;
+            } else {
+                [self commitPendingStopNow];
+            }
+        }
+        return;
+    }
 
     if (self.mode == PTTModeToggleOnly) {
         if (self.state == AppStateIdle) {
@@ -2316,6 +2432,68 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)handleTriggerUp {
+    if (self.mode == PTTModeDoubleTap) {
+        if (!self.serverReady || self.state == AppStateTranscribing) return;
+        NSTimeInterval now = CACurrentMediaTime();
+        NSTimeInterval pressDuration = (self.tapDownTime > 0) ? (now - self.tapDownTime) : 0.0;
+        BOOL wasCleanSoloTap = !atomic_load(&_tapOtherKeyPressedDuringHold) && (pressDuration < 0.45);
+
+        if (self.state == AppStateIdle) {
+            if (!wasCleanSoloTap) {
+                self.awaitingSecondTapWhileIdle = NO;
+                self.lastIdleSoloTapUpTime = 0;
+                return;
+            }
+            if (self.awaitingSecondTapWhileIdle) {
+                self.awaitingSecondTapWhileIdle = NO;
+                self.lastIdleSoloTapUpTime = 0;
+                self.osdResetFlashUntil = 0;
+                [self beginSessionWithState:AppStateLocked includePreRoll:YES];
+            } else {
+                self.lastIdleSoloTapUpTime = now;
+                atomic_store(&_tapInterveningKeyPressed, NO);
+            }
+            return;
+        }
+
+        if (self.state == AppStateLocked) {
+            if (self.awaitingResetSecondTapUp) {
+                self.awaitingResetSecondTapUp = NO;
+                if (wasCleanSoloTap) {
+                    // Double-tap while active: clear buffer and start over!
+                    [self clearBufferAndRestartLockedSession];
+                } else {
+                    // Second press was a shortcut chord (e.g. Cmd+Tab right after stopping) -> commit the stop
+                    [self finishRecordingAndTranscribeFromReleaseTime:self.pendingStopReleaseTime];
+                }
+                return;
+            }
+
+            if (!wasCleanSoloTap) {
+                // Ignore modifier chords (e.g. Cmd+C, Shift+letter) while recording hands-free
+                return;
+            }
+
+            // First clean solo tap while active: schedule stop & send (overlaps with post-roll window so zero extra lag)
+            self.pendingStopReleaseTime = now;
+            atomic_store(&_tapInterveningKeyPressed, NO);
+            [self.pendingStopTimer invalidate];
+            NSTimeInterval stopDelay = 0.30;
+#ifdef VOICEPTT_TEST
+            if (self.testPendingStopDelayOverride > 0.0) {
+                stopDelay = self.testPendingStopDelayOverride;
+            }
+#endif
+            __weak typeof(self) weakSelf = self;
+            self.pendingStopTimer = [NSTimer scheduledTimerWithTimeInterval:stopDelay repeats:NO block:^(NSTimer * _Nonnull timer) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                [strongSelf commitPendingStopNow];
+            }];
+        }
+        return;
+    }
+
     if (self.state != AppStateHolding) return;
 
     NSTimeInterval heldDuration = CACurrentMediaTime() - self.holdStartTime;
@@ -2363,6 +2541,12 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 - (void)cancelRecording {
     self.sessionGen++;
     [self stopStreamTimer];
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingSecondTapWhileIdle = NO;
+    self.awaitingResetSecondTapUp = NO;
+    self.lastIdleSoloTapUpTime = 0;
+    self.osdResetFlashUntil = 0;
     [self.postRollTimer invalidate];
     self.postRollTimer = nil;
     [self.audioLock lock];
@@ -2434,7 +2618,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)runStreamingPass {
-    if (self.streamPassInFlight || self.finalizePending || (self.state != AppStateHolding && self.state != AppStateLocked)) return;
+    if (self.streamPassInFlight || self.finalizePending || self.pendingStopTimer != nil || (self.state != AppStateHolding && self.state != AppStateLocked)) return;
 
     uint64_t tailStart = 0;
     uint64_t nowSample = 0;
@@ -2666,9 +2850,16 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 #pragma mark - Extraction, Finalization, Decision Router & LLM Refinement
 
 - (void)finishRecordingAndTranscribe {
+    [self finishRecordingAndTranscribeFromReleaseTime:CACurrentMediaTime()];
+}
+
+- (void)finishRecordingAndTranscribeFromReleaseTime:(NSTimeInterval)initialReleaseTime {
     // Keep sessionGen intact so an in-flight streaming pass hands off cleanly instead of being discarded
     NSUInteger gen = self.sessionGen;
     [self stopStreamTimer];
+    [self.pendingStopTimer invalidate];
+    self.pendingStopTimer = nil;
+    self.awaitingResetSecondTapUp = NO;
     [self.postRollTimer invalidate];
     self.postRollTimer = nil;
 
@@ -2680,7 +2871,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     postRollSilenceMs = MAX(150, MIN(2000, postRollSilenceMs));
     postRollMaxMs = MAX(postRollMinMs, MIN(4000, postRollMaxMs));
 
-    NSTimeInterval releaseTime = CACurrentMediaTime();
+    NSTimeInterval releaseTime = (initialReleaseTime > 0.0) ? initialReleaseTime : CACurrentMediaTime();
     self.finalizePipelineStart = releaseTime;
     self.state = AppStateTranscribing;
     [self updateUI];

@@ -203,6 +203,8 @@ static void DestroyTestApp(VoicePTTApp *app, NSString *tempDir) {
     atomic_store(&app->_tapShuttingDown, YES);
     atomic_fetch_add(&app->_audioRestartGen, 1);
     [app stopStreamTimer];
+    [app.pendingStopTimer invalidate];
+    app.pendingStopTimer = nil;
     [app.postRollTimer invalidate];
     app.postRollTimer = nil;
     [app.toastTimer invalidate];
@@ -1334,6 +1336,162 @@ static void TestMenuPopulationPreferencesModelsAndOSDRendering(void) {
     DestroyTestApp(app, tmp);
 }
 
+static void SimulateSoloTap(VoicePTTApp *app) {
+    atomic_store(&app->_tapOtherKeyPressedDuringHold, NO);
+    [app handleTriggerDown];
+    app.tapDownTime = CACurrentMediaTime() - 0.04;
+    [app handleTriggerUp];
+}
+
+static void TestDoubleTapModeStartStopClearAbortAndLeftKeys(void) {
+    NSString *tmp = nil;
+    VoicePTTApp *app = CreateTestApp(&tmp);
+    app.mode = PTTModeDoubleTap;
+    app.testPendingStopDelayOverride = 0.08;
+    app.testURLSession = CreateMockURLSession();
+    app.testFrontAppNameOverride = @"Notes";
+    app.testFrontAppBundleIDOverride = @"com.apple.Terminal";
+    app.gatePresetIndex = 2; // 0.025
+    atomic_store(&app->_audioQueueRunningAtomic, YES);
+
+    NSMutableDictionary *cfg = [[app defaultPipelineConfig] mutableCopy];
+    cfg[@"post_roll_min_ms"] = @100;
+    cfg[@"post_roll_silence_ms"] = @150;
+    cfg[@"post_roll_max_ms"] = @350;
+    [app savePipelineConfig:cfg];
+
+    // 1. Bind Left Command (index 6, keyCode 55) & Left Option (index 5, keyCode 58) & Left Shift (index 9, keyCode 56)
+    EXPECT_EQ_INT(kHotkeyOptions[5].keyCode, 58);
+    EXPECT_EQ_INT(kHotkeyOptions[6].keyCode, 55);
+    EXPECT_EQ_INT(kHotkeyOptions[7].keyCode, 59);
+    EXPECT_EQ_INT(kHotkeyOptions[8].keyCode, 60);
+    EXPECT_EQ_INT(kHotkeyOptions[9].keyCode, 56);
+
+    // Device-dependent left vs right disambiguation: holding Right Shift while releasing Left Shift
+    HotkeyOption leftShift = kHotkeyOptions[9];
+    CGEventFlags bothShifts = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
+    CGEventFlags onlyRightShift = kCGEventFlagMaskShift | NX_DEVICERSHIFTKEYMASK;
+    EXPECT_TRUE(IsHotkeyModifierDown(leftShift, bothShifts));
+    EXPECT_FALSE(IsHotkeyModifierDown(leftShift, onlyRightShift));
+
+    // Bind Left Command via EventTapCallback and verify Cmd+V twice quickly does NOT start recording!
+    app.hotkeyIndex = 6; // Left Command (keyCode 55)
+    for (int i = 0; i < 2; i++) {
+        CGEventRef cmdDown = CGEventCreate(NULL);
+        CGEventSetType(cmdDown, kCGEventFlagsChanged);
+        CGEventSetIntegerValueField(cmdDown, kCGKeyboardEventKeycode, 55);
+        CGEventSetFlags(cmdDown, kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK);
+        EventTapCallback(NULL, kCGEventFlagsChanged, cmdDown, (__bridge void *)app);
+
+        CGEventRef vKey = CGEventCreateKeyboardEvent(NULL, 9, true); // 'v'
+        EventTapCallback(NULL, kCGEventKeyDown, vKey, (__bridge void *)app);
+
+        CGEventRef cmdUp = CGEventCreate(NULL);
+        CGEventSetType(cmdUp, kCGEventFlagsChanged);
+        CGEventSetIntegerValueField(cmdUp, kCGKeyboardEventKeycode, 55);
+        CGEventSetFlags(cmdUp, 0);
+        EventTapCallback(NULL, kCGEventFlagsChanged, cmdUp, (__bridge void *)app);
+
+        CFRelease(cmdDown);
+        CFRelease(vKey);
+        CFRelease(cmdUp);
+    }
+    __block BOOL drained = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{ drained = YES; });
+    EXPECT_TRUE(PumpMainRunLoopUntil(0.5, ^BOOL { return drained; }));
+    EXPECT_EQ_INT(app.state, AppStateIdle);
+
+    // Intervening normal key between two solo taps (e.g. Shift, 'a', Shift) must NOT start recording!
+    SimulateSoloTap(app);
+    EXPECT_EQ_INT(app.state, AppStateIdle);
+    atomic_store(&app->_tapInterveningKeyPressed, YES);
+    app.lastIdleSoloTapUpTime = CACurrentMediaTime() - 0.05;
+    SimulateSoloTap(app);
+    EXPECT_EQ_INT(app.state, AppStateIdle);
+
+    // Reset idle tap window before testing a fresh clean double-tap from scratch
+    app.lastIdleSoloTapUpTime = 0;
+
+    // 2. Clean double-tap starts recording (AppStateLocked)
+    SimulateSoloTap(app);
+    EXPECT_EQ_INT(app.state, AppStateIdle);
+    app.lastIdleSoloTapUpTime = CACurrentMediaTime() - 0.05;
+    atomic_store(&app->_tapInterveningKeyPressed, NO);
+    SimulateSoloTap(app);
+    EXPECT_EQ_INT(app.state, AppStateLocked);
+
+    // Populate speech + committed text in first take
+    NSData *oldSpeech = MakeSinePCM(12000, 700.0, 12000.0);
+    AppendSamplesToRing(app, (const int16_t *)oldSpeech.bytes, 12000);
+    app.committedText = @"wrong first take scratch this";
+    app.liveCaptionText = @"wrong first take scratch this";
+
+    // 3. Double-tap while recording CLEARS the buffer and starts over fresh!
+    SimulateSoloTap(app); // Tap 1 arms pendingStopTimer
+    EXPECT_TRUE(app.pendingStopTimer != nil);
+    EXPECT_EQ_INT(app.state, AppStateLocked);
+    atomic_store(&app->_tapInterveningKeyPressed, NO);
+    SimulateSoloTap(app); // Tap 2 clears buffer & restarts!
+    EXPECT_EQ_INT(app.state, AppStateLocked);
+    EXPECT_TRUE(app.pendingStopTimer == nil);
+    EXPECT_EQ_STR(app.committedText, @"");
+    EXPECT_EQ_STR(app.liveCaptionText, @"");
+    // Start sample moved past oldSpeech (0ms pre-roll on reset so old speech cannot bleed in!)
+    EXPECT_EQ_INT(app->_captureStartSample, app->_ringTotalSamples);
+
+    // 4. Normal typing / chords while recording do NOT stop recording, then single-tap stops & sends!
+    NSData *freshSpeech = MakeSinePCM(12000, 800.0, 13000.0);
+    NSData *sil = [NSMutableData dataWithLength:4800 * sizeof(int16_t)];
+    AppendSamplesToRing(app, (const int16_t *)freshSpeech.bytes, 12000);
+    AppendSamplesToRing(app, (const int16_t *)sil.bytes, 4800);
+    [app.audioLock lock];
+    app->_captureLastSpeechSample = app->_ringTotalSamples - 4800;
+    app->_capturePeakRMS = 0.25f;
+    [app.audioLock unlock];
+
+    // Simulate Cmd+C chord while recording -> ignored, stays Locked
+    [app handleTriggerDown];
+    app.tapDownTime = CACurrentMediaTime() - 0.05;
+    atomic_store(&app->_tapOtherKeyPressedDuringHold, YES);
+    [app handleTriggerUp];
+    EXPECT_EQ_INT(app.state, AppStateLocked);
+
+    __block NSString *emittedText = nil;
+    __block BOOL emittedPaste = NO;
+    app.testDeliverTextHook = ^(NSString *text, BOOL shouldPaste, NSString *statusTag) {
+        emittedText = text;
+        emittedPaste = shouldPaste;
+    };
+    SetMockHTTPHandler(^NSData *(NSURLRequest *req, NSData *body, NSInteger *status, NSError **err) {
+        return [@"{\"text\":\"Fresh clean second take.\"}" dataUsingEncoding:NSUTF8StringEncoding];
+    });
+
+    // Single solo tap stops & sends to active text window
+    SimulateSoloTap(app);
+    EXPECT_TRUE(PumpMainRunLoopUntil(2.0, ^BOOL { return app.state == AppStateIdle && emittedText != nil; }));
+    EXPECT_EQ_STR(emittedText, @"Fresh clean second take.");
+    EXPECT_TRUE(emittedPaste);
+
+    // 5. Double-tap to start again, then Esc aborts immediately without emitting anything!
+    emittedText = nil;
+    SimulateSoloTap(app);
+    app.lastIdleSoloTapUpTime = CACurrentMediaTime() - 0.05;
+    atomic_store(&app->_tapInterveningKeyPressed, NO);
+    SimulateSoloTap(app);
+    EXPECT_EQ_INT(app.state, AppStateLocked);
+    app.committedText = @"do not send this";
+
+    CGEventRef escEv = CGEventCreateKeyboardEvent(NULL, 53, true);
+    EXPECT_TRUE(EventTapCallback(NULL, kCGEventKeyDown, escEv, (__bridge void *)app) == NULL);
+    CFRelease(escEv);
+    EXPECT_TRUE(PumpMainRunLoopUntil(0.5, ^BOOL { return app.state == AppStateIdle; }));
+    EXPECT_TRUE(emittedText == nil);
+    EXPECT_EQ_STR(app.committedText, @"");
+
+    SetMockHTTPHandler(nil);
+    DestroyTestApp(app, tmp);
+}
+
 // =============================================================================
 // Entry Point
 // =============================================================================
@@ -1363,6 +1521,7 @@ int main(int argc, const char * argv[]) {
         RunTest("End-to-end post-roll finalize, fast path, DR discard & mic drop", TestEndToEndPostRollFinalizeFastPathDiscardAndMicDrop);
         RunTest("EventTap modifier, non-modifier F5 & NX_SYSDEFINED media key paths", TestEventTapModifierNonModifierAndMediaKeyPaths);
         RunTest("Menu population, model/VAD discovery, prefs & OSD rendering", TestMenuPopulationPreferencesModelsAndOSDRendering);
+        RunTest("Double-Tap mode (2x start, 1x send, 2x clear, Esc abort) & Left keys", TestDoubleTapModeStartStopClearAbortAndLeftKeys);
 
         printf("\nSummary: %d/%d passed", gTestsPassed, gTestsRun);
         if (gTestsFailed > 0) {

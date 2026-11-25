@@ -18,9 +18,9 @@ Zero Electron, zero Python runtime dependencies — just a single Objective-C Co
   - **Smart Auto (default)**: Inspects macOS Accessibility focus (`AXUIElement` + terminal bundle IDs). Pastes cleanly into editable fields/terminals (preserving your existing clipboard), or copies to clipboard + flashes a non-activating OSD toast when no text input is focused.
   - **Always Paste** and **Clipboard Only** modes also available.
 - **Flexible Triggers**:
-  - **Smart Mode**: Hold to talk, or quick double-tap to lock hands-free (Esc cancels anytime).
-  - **Hold Only** or **Tap-to-Toggle** modes.
-  - Configurable hotkey (`Right ⌥`, `Right ⌘`, `Right ⌃`, `F5`, `F13 / Foot Pedal`) + wired headset inline Play/Pause button support.
+  - **Double-Tap Mode (default)**: Double-tap to start recording, single-tap to stop & send, double-tap while active to clear the buffer & start over, or press `Esc` anytime to abort.
+  - **Smart Mode** (hold to talk or double-tap to lock), **Hold Only**, and **Tap-to-Toggle** modes also available.
+  - Configurable **Left or Right** modifier hotkeys (`Left/Right ⌥`, `Left/Right ⌘`, `Left/Right ⌃`, `Left/Right ⇧`, `F5`, `F13 / Foot Pedal`) with shortcut-chord immunity (`Cmd+C`, `Shift+letter`, etc. never false-trigger) + wired headset inline Play/Pause button support.
 - **Optional Post-Processing Pipeline**:
   - **OpenAI-Compatible LLM Refinement** (Ollama, `llama-server`, LM Studio, OpenAI, etc.) with active-app context, word-count skip gate, and automatic fallback to raw ASR on timeout/error.
   - **Decision Router (DR) HTTP Hook** structured for single-pass decision models like XTuner's **Intern-Decision** (`needs_refine`, `output_action`, `style`).
